@@ -2430,6 +2430,9 @@ impl<'a> Socket<'a> {
         }
     }
 
+    #[cfg(feature = "tcp-segmentation")]
+    pub(crate) fn segmentation_mss(&self) -> usize { self.remote_mss }
+
     pub(crate) fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
     where
         F: FnOnce(&mut Context, PacketMeta, (IpRepr, TcpRepr)) -> Result<(), E>,
@@ -2694,6 +2697,13 @@ impl<'a> Socket<'a> {
                         .unwrap_or(effective_mss)
                     };
 
+                    #[cfg(feature = "tcp-segmentation")]
+                    let device_limit = if matches!(self.state, State::Established | State::CloseWait)
+                        && matches!(ip_repr, IpRepr::Ipv4(_)) && repr.timestamp.is_none()
+                        && self.remote_mss >= 64 && !is_zero_window_probe {
+                        cx.tcp_segmented_len().map(|max| max - 54).unwrap_or(device_limit)
+                    } else { device_limit };
+
                     let size = if is_zero_window_probe {
                         // Zero-window probes are exempt from the congestion window: they
                         // are sent precisely when normal transmission is impossible, and
@@ -2718,6 +2728,7 @@ impl<'a> Socket<'a> {
 
                     offset
                 };
+
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
@@ -9872,4 +9883,85 @@ mod test {
         recv_nothing!(s);
         assert_eq!(s.state, State::Closed);
     }
+    #[cfg(all(feature = "tcp-segmentation", not(feature = "proto-ipv6")))]
+    fn native_socket() -> TestSocket {
+        let mut s = socket_established_with_buffer_sizes(65536, 65536);
+        s.cx.test_enable_tcp_segmentation(32768);
+        s.set_congestion_control(CongestionControl::None);
+        s.remote_win_len = 65535;
+        s.remote_mss = 1460;
+        s
+    }
+
+    #[test]
+    #[cfg(all(feature = "tcp-segmentation", not(feature = "proto-ipv6")))]
+    fn native_segmentation_large_send_retry_and_retransmit() {
+        let mut s = native_socket();
+        let payload: Vec<u8> = (0..32714).map(|i| (i % 251) as u8).collect();
+        s.send_slice(&payload).unwrap();
+        let seq = s.remote_last_seq;
+        let rejected: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _, (_, tcp)| {
+            assert_eq!(tcp.payload, payload); assert_eq!(tcp.seq_number, seq); Err(())
+        });
+        assert_eq!(rejected, Err(())); assert_eq!(s.remote_last_seq, seq);
+        recv(&mut s, Instant::from_millis(0), |r| {
+            let tcp = r.unwrap(); assert_eq!(tcp.payload, payload);
+            assert_eq!(tcp.control, TcpControl::Psh); assert_eq!(tcp.seq_number, seq);
+        });
+        assert_eq!(s.remote_last_seq, seq + payload.len());
+        recv(&mut s, Instant::from_millis(2000), |r| {
+            let tcp = r.unwrap(); assert_eq!(tcp.payload, payload);
+            assert_eq!(tcp.seq_number, seq);
+        });
+    }
+
+    #[test]
+    #[cfg(all(feature = "tcp-segmentation", feature = "socket-tcp-reno", not(feature = "proto-ipv6")))]
+    fn native_segmentation_respects_cwnd_and_receiver_window() {
+        let mut s = native_socket();
+        s.set_congestion_control(CongestionControl::Reno);
+        s.send_slice(&vec![0x5a; 8192]).unwrap();
+        let window = s.congestion_controller.inner().window();
+        recv(&mut s, Instant::ZERO, |r| assert_eq!(r.unwrap().payload.len(), window));
+        recv_nothing(&mut s, Instant::from_millis(1));
+        let mut s = native_socket(); s.remote_win_len = 900;
+        s.send_slice(&vec![0x5a; 8192]).unwrap();
+        recv(&mut s, Instant::ZERO, |r| assert_eq!(r.unwrap().payload.len(), 900));
+        recv_nothing(&mut s, Instant::from_millis(1));
+    }
+
+    #[test]
+    #[cfg(all(feature = "tcp-segmentation", not(feature = "proto-ipv6")))]
+    fn native_segmentation_falls_back_for_fin_and_small_peer_mss() {
+        let mut s = native_socket(); s.remote_mss = 63;
+        s.send_slice(&vec![0x5a; 8192]).unwrap();
+        recv(&mut s, Instant::ZERO, |r| assert_eq!(r.unwrap().payload.len(), 63));
+        let mut s = native_socket();
+        // Queued data followed by FIN retains the ordinary MSS path.
+        s.send_slice(&vec![0x5a; 8192]).unwrap();
+        s.close();
+        recv(&mut s, Instant::ZERO, |r| assert_eq!(r.unwrap().payload.len(), 1460));
+    }
+
+    #[test]
+    #[cfg(all(feature = "tcp-segmentation", not(feature = "proto-ipv6")))]
+    fn native_segmentation_partial_ack_retransmits_only_unacked_suffix() {
+        let mut s = native_socket();
+        let payload: Vec<u8> = (0..4097).map(|i| (i % 251) as u8).collect();
+        s.send_slice(&payload).unwrap();
+        recv(&mut s, Instant::ZERO, |r| assert_eq!(r.unwrap().payload.len(), 4097));
+        send!(s, time 5, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 1460),
+            window_len: 65535,
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.send_queue(), 4097 - 1460);
+        recv(&mut s, Instant::from_millis(2000), |r| {
+            let tcp = r.unwrap();
+            assert_eq!(tcp.seq_number, LOCAL_SEQ + 1 + 1460);
+            assert_eq!(tcp.payload, &payload[1460..]);
+        });
+    }
+
 }

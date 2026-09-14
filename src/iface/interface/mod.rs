@@ -783,7 +783,18 @@ impl Interface {
                 }
                 #[cfg(feature = "socket-tcp")]
                 Socket::Tcp(socket) => {
+                    #[cfg(feature = "tcp-segmentation")]
+                    let remote_mss = socket.segmentation_mss();
                     socket.dispatch(&mut self.inner, |inner, meta, (ip, tcp)| {
+                        #[allow(unused_mut)]
+                        let mut meta = meta;
+                        #[cfg(feature = "tcp-segmentation")]
+                        if inner.tcp_segmented_len().is_some()
+                            && matches!(ip, IpRepr::Ipv4(_))
+                            && tcp.header_len() == 20
+                            && tcp.payload.len() > remote_mss.min(inner.ip_mtu() - 40) {
+                            meta.tcp_segment_size = Some(remote_mss.min(inner.ip_mtu() - 40) as u16);
+                        }
                         respond(inner, meta, Packet::new(ip, IpPayload::Tcp(tcp)))
                     })
                 }
@@ -857,6 +868,20 @@ impl InterfaceInner {
     #[allow(unused)] // unused depending on which sockets are enabled
     pub(crate) fn ip_mtu(&self) -> usize {
         self.caps.ip_mtu()
+    }
+
+    #[cfg(all(test, feature = "tcp-segmentation"))]
+    pub(crate) fn test_enable_tcp_segmentation(&mut self, max: usize) {
+        self.caps.medium = Medium::Ethernet;
+        self.caps.max_transmission_unit = 1514;
+        self.caps.tcp_max_segmented_len = Some(max);
+    }
+
+    #[cfg(feature = "tcp-segmentation")]
+    pub(crate) fn tcp_segmented_len(&self) -> Option<usize> {
+        if self.caps.medium != Medium::Ethernet { return None; }
+        self.caps.tcp_max_segmented_len.filter(|n| *n > self.caps.max_transmission_unit)
+            .map(|n| n.min(32768))
     }
 
     #[allow(unused)] // unused depending on which sockets are enabled, and in tests
@@ -1289,6 +1314,24 @@ impl InterfaceInner {
         };
 
         let total_ip_len = ip_repr.buffer_len();
+        // Oversized emission is permitted only for an explicit supported TCP
+        // data request. UDP, control packets and ordinary MTU checks are unchanged.
+        #[cfg(feature = "tcp-segmentation")]
+        if let Some(mss) = meta.tcp_segment_size {
+            let valid = matches!(packet.payload(), IpPayload::Tcp(tcp)
+                if tcp.header_len() == 20 && tcp.ack_number.is_some()
+                && matches!(tcp.control, crate::wire::TcpControl::None | crate::wire::TcpControl::Psh)
+                && !tcp.payload.is_empty());
+            assert!(matches!(ip_repr, IpRepr::Ipv4(_)) && valid);
+            assert!(mss >= 64 && mss as usize <= self.caps.ip_mtu() - 40);
+            assert!(self.tcp_segmented_len().is_some_and(|max| total_len <= max));
+            tx_token.set_meta(meta);
+            tx_token.consume(total_len, |buffer| {
+                emit_ethernet(&ip_repr, buffer);
+                emit_ip(&ip_repr, &mut buffer[14..]);
+            });
+            return Ok(());
+        }
 
         match &mut ip_repr {
             #[cfg(feature = "proto-ipv4")]

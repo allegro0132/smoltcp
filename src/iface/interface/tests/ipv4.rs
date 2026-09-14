@@ -1548,3 +1548,46 @@ fn test_ipv4_fragment_size() {
         );
     }
 }
+
+#[test]
+#[cfg(feature = "tcp-segmentation")]
+fn native_segmentation_metadata_preserves_wire_mtu() {
+    struct Capture<'a> { bytes: &'a mut Vec<u8>, meta: &'a mut PacketMeta }
+    impl TxToken for Capture<'_> {
+        fn set_meta(&mut self, meta: PacketMeta) { *self.meta = meta; }
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+            self.bytes.resize(len, 0); f(self.bytes)
+        }
+    }
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    iface.inner.test_enable_tcp_segmentation(32768);
+    let addr = Ipv4Address::new(127,0,0,1);
+    iface.inner.neighbor_cache.fill(IpAddress::Ipv4(addr),
+        HardwareAddress::Ethernet(EthernetAddress([2,2,2,2,2,2])), Instant::ZERO);
+    // Even a logical packet below the link MTU requires metadata when it
+    // exceeds the peer's smaller MSS. Larger sends retain exactly MTU 1500.
+    for (length, mss) in [(1000, 300), (32714, 1460)] {
+        let payload: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
+        let tcp = TcpRepr {
+            src_port: 1234, dst_port: 5678, control: TcpControl::Psh,
+            seq_number: TcpSeqNumber(123), ack_number: Some(TcpSeqNumber(456)),
+            window_len: 32768, window_scale: None, max_seg_size: None,
+            sack_permitted: false, sack_ranges: [None;3], timestamp: None,
+            payload: &payload,
+        };
+        let ip = Ipv4Repr { src_addr: addr, dst_addr: addr, next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(), hop_limit: 64 };
+        let mut bytes = Vec::new(); let mut observed = PacketMeta::default();
+        let mut meta = PacketMeta::default(); meta.tcp_segment_size = Some(mss);
+        assert_eq!(iface.inner.dispatch_ip(Capture { bytes: &mut bytes, meta: &mut observed },
+            meta, Packet::new_ipv4(ip, IpPayload::Tcp(tcp)), &mut iface.fragmenter), Ok(()));
+        assert_eq!(observed.tcp_segment_size, Some(mss));
+        assert_eq!(iface.inner.ip_mtu(), 1500);
+        assert_eq!(bytes.len(), length + 54);
+        assert_eq!(&bytes[54..], &payload);
+        let ip = Ipv4Packet::new_checked(&bytes[14..]).unwrap();
+        assert!(ip.dont_frag()); assert!(ip.verify_checksum());
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.verify_checksum(&IpAddress::Ipv4(addr), &IpAddress::Ipv4(addr)));
+    }
+}

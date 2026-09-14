@@ -168,6 +168,10 @@ pub const IPV4_FRAGMENT_PAYLOAD_ALIGNMENT: usize = 8;
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct PacketMeta {
+    /// Logical IPv4/TCP data request. The device must segment before transmission,
+    /// preserving TCP sequence/PSH and generating each segment's checksums.
+    #[cfg(feature = "tcp-segmentation")]
+    pub tcp_segment_size: Option<u16>,
     #[cfg(feature = "packetmeta-id")]
     pub id: u32,
 
@@ -276,6 +280,11 @@ pub struct SegmentationCapabilities {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub struct DeviceCapabilities {
+    /// Maximum logical Ethernet/IPv4/TCP request length, including headers.
+    /// None disables large sends. This never changes the advertised wire MTU.
+    /// The device must support lossless hardware or software segmentation.
+    #[cfg(feature = "tcp-segmentation")]
+    pub tcp_max_segmented_len: Option<usize>,
     /// Medium of the device.
     ///
     /// This indicates what kind of packet the sent/received bytes are, and determines
