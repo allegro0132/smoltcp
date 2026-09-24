@@ -299,3 +299,6 @@ pub fn tcp_listen_drops_unspecified_src() {
     assert_eq!(reply, None);
     assert!(sockets.get_mut::<tcp::Socket>(handle).is_listening());
 }
+
+#[cfg(feature = "tcp-gro-receive")]
+mod tcp_gro;

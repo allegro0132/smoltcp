@@ -100,6 +100,16 @@ impl InterfaceInner {
         ipv4_packet: &Ipv4Packet<&'a [u8]>,
         frag: &'a mut FragmentsBuffer,
     ) -> Option<Packet<'a>> {
+        self.process_ipv4_payload(sockets, meta, source_hardware_addr, ipv4_packet, frag,
+            #[cfg(feature = "tcp-gro-receive")] None)
+    }
+
+    pub(super) fn process_ipv4_payload<'a>(
+        &mut self, sockets: &mut SocketSet, meta: PacketMeta,
+        source_hardware_addr: HardwareAddress, ipv4_packet: &Ipv4Packet<&'a [u8]>,
+        frag: &'a mut FragmentsBuffer,
+        #[cfg(feature = "tcp-gro-receive")] gro: Option<&crate::phy::TcpGro<'a>>,
+    ) -> Option<Packet<'a>> {
         let mut ipv4_repr = check!(Ipv4Repr::parse(ipv4_packet, &self.caps.checksum));
         if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {
             // Discard packets with non-unicast source addresses but allow unspecified
@@ -145,6 +155,8 @@ impl InterfaceInner {
         #[cfg(not(feature = "proto-ipv4-fragmentation"))]
         let ip_payload = ipv4_packet.payload();
 
+        #[cfg(feature = "tcp-gro-receive")]
+        if let Some(gro) = gro { ipv4_repr.payload_len = gro.ip_payload_len(); }
         let ip_repr = IpRepr::Ipv4(ipv4_repr);
 
         #[cfg(feature = "socket-raw")]
@@ -232,7 +244,8 @@ impl InterfaceInner {
 
             #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => {
-                self.process_tcp(sockets, handled_by_raw_socket, ip_repr, ip_payload)
+                self.process_tcp_payload(sockets, handled_by_raw_socket, ip_repr, ip_payload,
+                    #[cfg(feature = "tcp-gro-receive")] gro)
             }
 
             _ if handled_by_raw_socket => None,

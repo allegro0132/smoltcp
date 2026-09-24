@@ -30,6 +30,18 @@ pub struct RingBuffer<'a, T: 'a> {
     length: usize,
 }
 
+#[cfg(feature = "tcp-align-empty-rx")]
+impl RingBuffer<'_, u8> {
+    /// Reposition an empty byte ring without changing capacity or clearing data.
+    /// TCP must also prove there are no outstanding assembler-relative bytes.
+    pub(crate) fn align_empty_to(&mut self, alignment: usize) {
+        if !self.is_empty() { return; }
+        let mask = core::mem::align_of::<usize>() - 1;
+        let offset = alignment.wrapping_sub(self.storage.as_ptr() as usize) & mask;
+        if offset < self.capacity() { self.read_at = offset; }
+    }
+}
+
 impl<'a, T: 'a> RingBuffer<'a, T> {
     /// Create a ring buffer with the given storage.
     ///
@@ -799,5 +811,38 @@ mod test {
 
         let large = ring.enqueue_many(8);
         assert_eq!(large.len(), 8);
+    }
+}
+
+#[cfg(all(test, feature = "tcp-align-empty-rx"))]
+mod align_empty_tests {
+    use super::RingBuffer;
+    #[test]
+    fn byte_alignment_preserves_small_windows_wrap_and_unread_data() {
+        let word = core::mem::align_of::<usize>();
+        for capacity in 0..=16 {
+            for shift in 0..word {
+                for alignment in 0..word {
+                    let mut bytes = [0u8; 32];
+                    let mut ring = RingBuffer::new(&mut bytes[shift..shift + capacity]);
+                    ring.align_empty_to(alignment);
+                    assert_eq!(ring.window(), capacity);
+                    assert_eq!(ring.len(), 0);
+                    if capacity >= word {
+                        assert_eq!(ring.get_unallocated(0, 1).as_ptr() as usize & (word - 1), alignment);
+                    }
+                    let expected: [u8; 16] = core::array::from_fn(|n| n as u8);
+                    assert_eq!(ring.enqueue_slice(&expected[..capacity]), capacity);
+                    if capacity != 0 {
+                        let pointer = ring.get_allocated(0, 1).as_ptr();
+                        ring.align_empty_to((alignment + 1) % word);
+                        assert_eq!(ring.get_allocated(0, 1).as_ptr(), pointer);
+                    }
+                    let mut output = [0; 16];
+                    assert_eq!(ring.dequeue_slice(&mut output), capacity);
+                    assert_eq!(&output[..capacity], &expected[..capacity]);
+                }
+            }
+        }
     }
 }

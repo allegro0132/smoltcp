@@ -431,6 +431,17 @@ pub trait Device {
     fn capabilities(&self) -> DeviceCapabilities;
 }
 
+/// Shared bound for borrowed TCP receive fragments and GRO construction.
+#[cfg(all(feature = "tcp-scatter-receive", feature = "tcp-gro-wide"))]
+pub const TCP_RX_MAX_FRAGMENTS: usize = 32;
+#[cfg(all(feature = "tcp-scatter-receive", not(feature = "tcp-gro-wide")))]
+pub const TCP_RX_MAX_FRAGMENTS: usize = 16;
+
+#[cfg(feature = "tcp-gro-receive")]
+mod tcp_gro;
+#[cfg(feature = "tcp-gro-receive")]
+pub use tcp_gro::{TCP_GRO_MAX_BYTES, TCP_GRO_MAX_SEGMENTS, TcpGro, TcpGroBuilder, TcpGroReject, TcpGroRx};
+
 /// A token to receive a single network packet.
 pub trait RxToken {
     /// Consumes the token to receive a single network packet.
@@ -440,6 +451,33 @@ pub trait RxToken {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R;
+
+    /// Consume one frame or a bounded IPv4/TCP GRO group. Every frame remains
+    /// borrowed until the callback returns. The interface validates the whole
+    /// group before socket mutation; unsupported groups are discarded. Devices
+    /// should submit non-coalescible traffic as ordinary single-frame tokens.
+    #[cfg(feature = "tcp-gro-receive")]
+    fn consume_gro<R, F>(self, f: F) -> R
+    where Self: Sized, F: FnOnce(&[&[u8]]) -> R {
+        self.consume(|frame| f(&[frame]))
+    }
+
+    /// Consume an immutable checked aggregate without parsing its members
+    /// again. Devices may override this when a `TcpGroBuilder` already checked
+    /// them while choosing the group. The interface still checks that the
+    /// group's checksum policy covers `caps`, then applies address admission.
+    /// The default validates groups supplied by `consume_gro` as before.
+    #[cfg(feature = "tcp-gro-receive")]
+    fn consume_gro_checked<R, F>(self, caps: &ChecksumCapabilities, f: F) -> R
+    where Self: Sized, F: FnOnce(TcpGroRx<'_>) -> R {
+        self.consume_gro(|frames| match frames {
+            [frame] => f(TcpGroRx::Frame(frame)),
+            _ => match TcpGro::new(frames, caps) {
+                Some(group) => f(TcpGroRx::Group(group)),
+                None => f(TcpGroRx::Invalid),
+            },
+        })
+    }
 
     /// The Packet ID associated with the frame received by this [`RxToken`]
     fn meta(&self) -> PacketMeta {

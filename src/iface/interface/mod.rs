@@ -650,7 +650,35 @@ impl Interface {
         };
 
         let rx_meta = rx_token.meta();
-        rx_token.consume(|frame| {
+        #[cfg(feature = "tcp-gro-receive")]
+        let checksum_caps = self.inner.caps.checksum.clone();
+        let consume = |#[cfg(feature = "tcp-gro-receive")] input: crate::phy::TcpGroRx<'_>,
+                       #[cfg(not(feature = "tcp-gro-receive"))] frame: &[u8]| {
+            #[cfg(feature = "tcp-gro-receive")]
+            let frame = match input {
+                crate::phy::TcpGroRx::Invalid => return PollIngressSingleResult::PacketProcessed,
+                crate::phy::TcpGroRx::Frame(frame) => frame,
+                crate::phy::TcpGroRx::Group(gro) => {
+                    if self.inner.caps.medium != Medium::Ethernet
+                        || !gro.satisfies_checksum_policy(&self.inner.caps.checksum) {
+                        return PollIngressSingleResult::PacketProcessed;
+                    }
+                    // Raw sockets require the complete packet bytes. Preserve their
+                    // normal filter/delivery path with a bounded materialization.
+                    #[cfg(feature = "socket-raw")]
+                    let materialized = gro.materialize();
+                    #[cfg(feature = "socket-raw")]
+                    let packet = self.inner.process_ethernet(sockets, rx_meta, &materialized, &mut self.fragments);
+                    #[cfg(not(feature = "socket-raw"))]
+                    let packet = self.inner.process_ethernet_payload(sockets, rx_meta, gro.first_frame(), &mut self.fragments, Some(&gro));
+                    if let Some(packet) = packet {
+                        if let Err(err) = self.inner.dispatch(tx_token, packet, &mut self.fragmenter) {
+                            net_debug!("Failed to send GRO response: {:?}", err);
+                        }
+                    }
+                    return PollIngressSingleResult::SocketStateChanged;
+                }
+            };
             if frame.is_empty() {
                 return PollIngressSingleResult::PacketProcessed;
             }
@@ -706,7 +734,11 @@ impl Interface {
             // We should return `PacketProcessed` for these to save the user from
             // doing useless socket polls.
             PollIngressSingleResult::SocketStateChanged
-        })
+        };
+        #[cfg(feature = "tcp-gro-receive")]
+        { rx_token.consume_gro_checked(&checksum_caps, consume) }
+        #[cfg(not(feature = "tcp-gro-receive"))]
+        { rx_token.consume(consume) }
     }
 
     fn socket_egress(

@@ -40,6 +40,14 @@ rand_chacha = "0.3.1"
 idna = { version = "=1.0.1" }
 
 [features]
+tcp-gro-full-batch = ["tcp-gro-wide"]
+tcp-gro-wide = ["tcp-gro-receive"]
+tcp-align-empty-rx = ["socket-tcp"]
+tcp-gro-receive = ["tcp-scatter-receive", "proto-ipv4", "medium-ethernet", "alloc"]
+# Internal receive storage abstraction; ingress integration is opt-in.
+tcp-scatter-receive = ["socket-tcp"]
+# Exchange a fully assembled receive buffer for equivalent empty storage.
+tcp-buffer-exchange = ["socket-tcp"]
 # Explicit logical TCP segmentation; the wire MTU remains unchanged.
 tcp-segmentation = ["socket-tcp", "proto-ipv4", "medium-ethernet"]
 std = ["managed/std", "alloc"]

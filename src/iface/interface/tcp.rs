@@ -10,6 +10,15 @@ impl InterfaceInner {
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
+        self.process_tcp_payload(sockets, handled_by_raw_socket, ip_repr, ip_payload,
+            #[cfg(feature = "tcp-gro-receive")] None)
+    }
+
+    pub(crate) fn process_tcp_payload<'frame>(
+        &mut self, sockets: &mut SocketSet, handled_by_raw_socket: bool,
+        ip_repr: IpRepr, ip_payload: &'frame [u8],
+        #[cfg(feature = "tcp-gro-receive")] gro: Option<&crate::phy::TcpGro<'frame>>,
+    ) -> Option<Packet<'frame>> {
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
 
         // Per RFC 1122 §3.2.1.3, the unspecified address must never appear as a source
@@ -34,6 +43,14 @@ impl InterfaceInner {
             .filter_map(|i| Socket::downcast_mut(&mut i.socket))
         {
             if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
+                #[cfg(feature = "tcp-gro-receive")]
+                if let Some(gro) = gro {
+                    let mut metadata = tcp_repr;
+                    metadata.payload = &[];
+                    metadata.control = gro.control();
+                    return tcp_socket.process_scattered(self, &ip_repr, &metadata, gro.payloads())
+                        .ok().flatten().map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+                }
                 return tcp_socket
                     .process(self, &ip_repr, &tcp_repr)
                     .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));

@@ -19,6 +19,8 @@ use crate::wire::{
 };
 
 mod congestion;
+mod receive_payload;
+use receive_payload::ReceivePayload;
 
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
@@ -1363,6 +1365,42 @@ impl<'a> Socket<'a> {
         })
     }
 
+    /// Exchange all readable bytes for empty storage without copying payloads.
+    ///
+    /// The replacement must be empty and have the same capacity as the current
+    /// receive buffer. On success the returned ring preserves the received
+    /// data's wrap position, and consumption has the same sequence/window
+    /// semantics as `recv`. This operation allocates no storage.
+    ///
+    /// On failure the replacement is returned unchanged and no bytes are
+    /// consumed. Exchange requires an open readable receive half, at least one
+    /// byte, at most `max_bytes`, and no outstanding out-of-order data. Callers
+    /// may fall back to `recv` when these conditions are not met.
+    ///
+    /// Both backing stores retain their ordinary Rust lifetimes. Integrators
+    /// with independently reclaimable task arenas must additionally ensure
+    /// that each store remains valid after transferring it to its new owner.
+    #[cfg(feature = "tcp-buffer-exchange")]
+    pub fn exchange_receive_buffer(
+        &mut self,
+        replacement: SocketBuffer<'a>,
+        max_bytes: usize,
+    ) -> Result<SocketBuffer<'a>, SocketBuffer<'a>> {
+        let length = self.rx_buffer.len();
+        if self.recv_error_check().is_err()
+            || length == 0
+            || length > max_bytes
+            || !self.assembler.is_empty()
+            || !replacement.is_empty()
+            || replacement.capacity() != self.rx_buffer.capacity()
+        {
+            return Err(replacement);
+        }
+        let received = core::mem::replace(&mut self.rx_buffer, replacement);
+        self.remote_seq_no += length;
+        Ok(received)
+    }
+
     /// Peek at a sequence of received octets without removing them from
     /// the receive buffer, and return a pointer to it.
     ///
@@ -1457,6 +1495,11 @@ impl<'a> Socket<'a> {
     }
 
     pub(crate) fn rst_reply(ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
+        Self::rst_reply_with_payload_len(ip_repr, repr, repr.payload.len())
+    }
+
+    fn rst_reply_with_payload_len(ip_repr: &IpRepr, repr: &TcpRepr, payload_len: usize)
+        -> (IpRepr, TcpRepr<'static>) {
         debug_assert!(repr.control != TcpControl::Rst);
 
         let (ip_reply_repr, mut reply_repr) = Self::reply(ip_repr, repr);
@@ -1466,7 +1509,7 @@ impl<'a> Socket<'a> {
         reply_repr.control = TcpControl::Rst;
         reply_repr.seq_number = repr.ack_number.unwrap_or_default();
         if repr.control == TcpControl::Syn && repr.ack_number.is_none() {
-            reply_repr.ack_number = Some(repr.seq_number + repr.segment_len());
+            reply_repr.ack_number = Some(repr.seq_number + payload_len + repr.control.len());
         }
 
         (ip_reply_repr, reply_repr)
@@ -1582,11 +1625,31 @@ impl<'a> Socket<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn process(
         &mut self,
         cx: &mut Context,
         ip_repr: &IpRepr,
         repr: &TcpRepr,
+    ) -> Option<(IpRepr, TcpRepr<'static>)> {
+        self.process_payload(cx, ip_repr, repr, repr.payload)
+    }
+
+    /// The ingress owner must validate headers/checksums before calling, just
+    /// as for process(). Payload bytes are borrowed only for this invocation.
+    /// The metadata representation must not also contain a contiguous payload.
+    #[cfg(feature = "tcp-scatter-receive")]
+    pub(crate) fn process_scattered(
+        &mut self, cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr,
+        fragments: &[&[u8]],
+    ) -> Result<Option<(IpRepr, TcpRepr<'static>)>, crate::wire::Error> {
+        if !repr.payload.is_empty() { return Err(crate::wire::Error); }
+        let payload = receive_payload::Scattered::new(fragments).ok_or(crate::wire::Error)?;
+        Ok(self.process_payload(cx, ip_repr, repr, payload))
+    }
+
+    fn process_payload<P: ReceivePayload>(
+        &mut self, cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr, incoming: P,
     ) -> Option<(IpRepr, TcpRepr<'static>)> {
         debug_assert!(self.accepts(cx, ip_repr, repr));
 
@@ -1626,7 +1689,7 @@ impl<'a> Socket<'a> {
             (State::SynSent, TcpControl::Syn, Some(ack_number)) => {
                 if ack_number != self.local_seq_no + 1 {
                     net_debug!("unacceptable SYN|ACK in response to initial SYN");
-                    return Some(Self::rst_reply(ip_repr, repr));
+                    return Some(Self::rst_reply_with_payload_len(ip_repr, repr, incoming.len()));
                 }
             }
             // TCP simultaneous open.
@@ -1649,7 +1712,7 @@ impl<'a> Socket<'a> {
                 net_debug!(
                     "expecting a SYN|ACK, received an ACK with the wrong ack_number, sending RST."
                 );
-                return Some(Self::rst_reply(ip_repr, repr));
+                return Some(Self::rst_reply_with_payload_len(ip_repr, repr, incoming.len()));
             }
             // Anything else in the SYN-SENT state is invalid.
             (State::SynSent, _, _) => {
@@ -1665,7 +1728,7 @@ impl<'a> Socket<'a> {
             (State::SynReceived, _, Some(ack_number)) => {
                 if ack_number != self.local_seq_no + 1 {
                     net_debug!("unacceptable ACK in response to SYN|ACK");
-                    return Some(Self::rst_reply(ip_repr, repr));
+                    return Some(Self::rst_reply_with_payload_len(ip_repr, repr, incoming.len()));
                 }
             }
             // Every acknowledgement must be for transmitted but unacknowledged data.
@@ -1710,11 +1773,11 @@ impl<'a> Socket<'a> {
             window_start
         };
         let segment_start = repr.seq_number;
-        let segment_end = repr.seq_number + repr.payload.len();
+        let segment_end = repr.seq_number + incoming.len();
 
         let (payload, payload_offset) = match self.state {
             // In LISTEN and SYN-SENT states, we have not yet synchronized with the remote end.
-            State::Listen | State::SynSent => (&[][..], 0),
+            State::Listen | State::SynSent => (incoming.slice(0..0), 0),
             _ => {
                 // https://www.rfc-editor.org/rfc/rfc9293.html#name-segment-acceptability-tests
                 let segment_in_window = match (
@@ -1779,7 +1842,7 @@ impl<'a> Socket<'a> {
                     self.local_rx_last_seq = Some(repr.seq_number);
 
                     (
-                        &repr.payload[overlap_start - segment_start..overlap_end - segment_start],
+                        incoming.slice(overlap_start - segment_start..overlap_end - segment_start),
                         overlap_start - window_start,
                     )
                 } else {
@@ -1818,7 +1881,7 @@ impl<'a> Socket<'a> {
                     // One per second is ample for a restarted peer to complete
                     // the challenge exchange, since it retransmits its SYN on
                     // its own timer.
-                    if !repr.payload.is_empty()
+                    if !incoming.is_empty()
                         && matches!(
                             repr.control,
                             TcpControl::None | TcpControl::Psh | TcpControl::Fin
@@ -2097,7 +2160,7 @@ impl<'a> Socket<'a> {
                 // Increment duplicate ACK count, notify congestion controller and
                 // set for retransmit if we just received the third duplicate ACK
                 Some(last_rx_ack)
-                    if repr.payload.is_empty()
+                    if incoming.is_empty()
                         && last_rx_ack == ack_number
                         && ack_number < self.remote_last_seq
                         && !is_window_update =>
@@ -2210,6 +2273,15 @@ impl<'a> Socket<'a> {
 
         let assembler_was_empty = self.assembler.is_empty();
 
+        // Only a drained, in-order stream may change physical ring origin.
+        // Unallocated out-of-order data is still relative to the old origin.
+        #[cfg(feature = "tcp-align-empty-rx")]
+        if assembler_was_empty && self.rx_buffer.is_empty() && payload_offset == 0 {
+            if let Some(alignment) = payload.first_alignment() {
+                self.rx_buffer.align_empty_to(alignment);
+            }
+        }
+
         // Try adding payload octets to the assembler.
         let Ok(contig_len) = self
             .assembler
@@ -2229,7 +2301,7 @@ impl<'a> Socket<'a> {
             payload_len,
             payload_offset
         );
-        let len_written = self.rx_buffer.write_unallocated(payload_offset, payload);
+        let len_written = payload.write_into(&mut self.rx_buffer, payload_offset);
         debug_assert!(len_written == payload_len);
 
         if contig_len != 0 {
@@ -3077,7 +3149,17 @@ mod test {
 
         assert!(socket.socket.accepts(&mut socket.cx, &ip_repr, repr));
 
-        match socket.socket.process(&mut socket.cx, &ip_repr, repr) {
+        #[cfg(feature = "tcp-scatter-receive")]
+        let response = {
+            // Run the existing TCP golden tests through fragmented storage too.
+            let midpoint = repr.payload.len() / 2;
+            let fragments = [&repr.payload[..midpoint], &[][..], &repr.payload[midpoint..]];
+            let metadata = TcpRepr { payload: &[], ..*repr };
+            socket.socket.process_scattered(&mut socket.cx, &ip_repr, &metadata, &fragments).unwrap()
+        };
+        #[cfg(not(feature = "tcp-scatter-receive"))]
+        let response = socket.socket.process(&mut socket.cx, &ip_repr, repr);
+        match response {
             Some((_ip_repr, repr)) => {
                 net_trace!("recv: {}", repr);
                 Some(repr)
@@ -7823,6 +7905,213 @@ mod test {
             payload:    &b"123456"[..],
             ..RECV_TEMPL
         }), exact);
+    }
+
+    #[cfg(feature = "tcp-scatter-receive")]
+    #[test]
+    fn test_scattered_receive_matches_contiguous_window_clipping_and_wrap() {
+        let bytes: Vec<u8> = (0..48).map(|n| (n * 7 + 3) as u8).collect();
+        for split in 0..=bytes.len() {
+            for displacement in [-8i32, 0, 8, 24, 32, 40] {
+                for sequence in [REMOTE_SEQ + 1, TcpSeqNumber(i32::MAX - 4)] {
+                    let mut contiguous = socket_established_with_buffer_sizes(64, 32);
+                    let mut scattered = socket_established_with_buffer_sizes(64, 32);
+                    for s in [&mut contiguous, &mut scattered] {
+                        s.remote_seq_no = sequence;
+                        s.remote_last_ack = Some(sequence);
+                        s.rx_buffer.enqueue_slice(&[0; 24]);
+                        s.rx_buffer.dequeue_slice(&mut [0; 24]);
+                    }
+                    let repr = TcpRepr { seq_number: TcpSeqNumber(sequence.0.wrapping_add(displacement)),
+                        ack_number: Some(LOCAL_SEQ + 1), payload: &bytes, ..SEND_TEMPL };
+                    let ip = IpReprIpvX(IpvXRepr { src_addr: REMOTE_ADDR, dst_addr: LOCAL_ADDR,
+                        next_header: IpProtocol::Tcp, payload_len: repr.buffer_len(), hop_limit: 64 });
+                    let a = contiguous.socket.process(&mut contiguous.cx, &ip, &repr);
+                    let parts = [&bytes[..split], &[][..], &bytes[split..]];
+                    let meta = TcpRepr { payload: &[], ..repr };
+                    let b = scattered.socket.process_scattered(&mut scattered.cx, &ip, &meta, &parts).unwrap();
+                    assert_eq!(a, b);
+                    assert_eq!(contiguous.state, scattered.state);
+                    assert_eq!(contiguous.remote_seq_no, scattered.remote_seq_no);
+                    assert_eq!(contiguous.remote_last_ack, scattered.remote_last_ack);
+                    assert_eq!(contiguous.scaled_window(), scattered.scaled_window());
+                    assert_eq!(std::format!("{:?}", contiguous.assembler), std::format!("{:?}", scattered.assembler));
+                    if displacement > 0 && displacement < 32 {
+                        let gap = [0xd7; 32];
+                        let fill = TcpRepr { seq_number: sequence, ack_number: Some(LOCAL_SEQ + 1),
+                            payload: &gap[..displacement as usize], ..SEND_TEMPL };
+                        assert_eq!(send(&mut contiguous, Instant::from_millis(1), &fill),
+                            send(&mut scattered, Instant::from_millis(1), &fill));
+                    }
+                    let mut a = [0; 64]; let mut b = [0; 64];
+                    let received = contiguous.recv_slice(&mut a);
+                    assert_eq!(received, scattered.recv_slice(&mut b));
+                    assert_eq!(a, b);
+                    if (0..32).contains(&displacement) {
+                        assert_eq!(received, Ok(32));
+                        let gap = displacement as usize;
+                        assert!(a[..gap].iter().all(|v| *v == 0xd7));
+                        assert_eq!(&a[gap..32], &bytes[..32-gap]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "tcp-scatter-receive")]
+    #[test]
+    fn test_scattered_receive_rejects_ambiguous_or_unbounded_storage() {
+        let mut s = socket_established();
+        let before = (s.remote_seq_no, s.recv_queue(), s.state);
+        let meta = TcpRepr { seq_number: REMOTE_SEQ + 1, ..SEND_TEMPL };
+        assert!(s.socket.process_scattered(&mut s.cx, &SEND_IP_TEMPL,
+            &TcpRepr { payload: b"duplicate", ..meta }, &[b"data"]).is_err());
+        assert!(s.socket.process_scattered(&mut s.cx, &SEND_IP_TEMPL, &meta, &[&[][..]; crate::phy::TCP_RX_MAX_FRAGMENTS + 1]).is_err());
+        let large = vec![0; 65536];
+        assert!(s.socket.process_scattered(&mut s.cx, &SEND_IP_TEMPL, &meta, &[&large]).is_err());
+        assert_eq!(before, (s.remote_seq_no, s.recv_queue(), s.state));
+    }
+
+    #[cfg(feature = "tcp-buffer-exchange")]
+    #[test]
+    fn test_exchange_receive_buffer_wrap_and_reuse() {
+        let mut s = socket_established_with_buffer_sizes(64, 8);
+        let original = s.rx_buffer.get_unallocated(0, 1).as_ptr();
+        assert_eq!(s.rx_buffer.enqueue_slice(b"abcdef"), 6);
+        assert_eq!(s.recv_slice(&mut [0; 5]), Ok(5));
+        assert_eq!(s.rx_buffer.enqueue_slice(b"ghijkl"), 6);
+        let sequence = s.remote_seq_no;
+        let mut spare = SocketBuffer::new(vec![0; 8]);
+        let spare_ptr = spare.get_unallocated(0, 1).as_ptr();
+        let mut received = s.exchange_receive_buffer(spare, 7).unwrap();
+        assert_eq!(s.remote_seq_no, sequence + 7);
+        assert_eq!(s.rx_buffer.capacity(), 8);
+        assert_eq!(s.recv_queue(), 0);
+        assert_eq!(s.rx_buffer.get_unallocated(0, 1).as_ptr(), spare_ptr);
+        assert_eq!(received.get_allocated(0, 7).as_ptr(), original.wrapping_add(5));
+        let mut bytes = [0; 7];
+        assert_eq!(received.dequeue_slice(&mut bytes), 7);
+        assert_eq!(&bytes, b"fghijkl");
+        assert_eq!(s.rx_buffer.enqueue_slice(b"xy"), 2);
+        let mut next = s.exchange_receive_buffer(received, 2).unwrap();
+        assert_eq!(next.get_allocated(0, 2).as_ptr(), spare_ptr);
+        assert_eq!(next.dequeue_slice(&mut bytes), 2);
+        assert_eq!(&bytes[..2], b"xy");
+    }
+
+    #[cfg(feature = "tcp-buffer-exchange")]
+    #[test]
+    fn test_exchange_receive_buffer_rejections_are_atomic() {
+        for case in 0..5 {
+            let mut s = socket_established_with_buffer_sizes(64, 8);
+            assert_eq!(s.rx_buffer.enqueue_slice(b"abc"), 3);
+            let mut spare = SocketBuffer::new(vec![0; if case == 0 { 7 } else { 8 }]);
+            if case == 1 { spare.enqueue_slice(b"z"); }
+            if case == 4 { s.rx_buffer.clear(); }
+            let sequence = s.remote_seq_no;
+            let spare_len = spare.len();
+            let spare_ptr = spare.get_unallocated(0, 1).as_ptr();
+            let mut returned = s.exchange_receive_buffer(spare, if case == 2 { 2 } else if case == 3 { 0 } else { 8 }).unwrap_err();
+            assert_eq!(returned.len(), spare_len);
+            assert_eq!(returned.get_unallocated(0, 1).as_ptr(), spare_ptr);
+            assert_eq!(s.remote_seq_no, sequence);
+            assert_eq!(s.recv_queue(), if case == 4 { 0 } else { 3 });
+        }
+    }
+
+    #[cfg(feature = "tcp-buffer-exchange")]
+    #[test]
+    fn test_exchange_receive_buffer_preserves_out_of_order_bytes() {
+        let mut s = socket_established();
+        let repr = |seq, payload| TcpRepr {
+            seq_number: REMOTE_SEQ + seq,
+            ack_number: Some(LOCAL_SEQ + 1), payload, ..SEND_TEMPL
+        };
+        let _ = send(&mut s, Instant::from_millis(0), &repr(1, b"abc"));
+        let _ = send(&mut s, Instant::from_millis(1), &repr(7, b"ghi"));
+        assert!(!s.assembler.is_empty());
+        let sequence = s.remote_seq_no;
+        let spare = s.exchange_receive_buffer(SocketBuffer::new(vec![0; 64]), 64).unwrap_err();
+        assert_eq!(s.remote_seq_no, sequence);
+        assert_eq!(s.recv_slice(&mut [0; 3]), Ok(3));
+        let spare = s.exchange_receive_buffer(spare, 64).unwrap_err();
+        let _ = send(&mut s, Instant::from_millis(2), &repr(4, b"def"));
+        let mut received = s.exchange_receive_buffer(spare, 64).unwrap();
+        let mut bytes = [0; 6];
+        assert_eq!(received.dequeue_slice(&mut bytes), 6);
+        assert_eq!(&bytes, b"defghi");
+        assert!(s.assembler.is_empty());
+    }
+
+    #[cfg(feature = "tcp-buffer-exchange")]
+    #[test]
+    fn test_exchange_receive_buffer_fin_and_ack_match_recv() {
+        let mut exchanged = socket_established();
+        let mut copied = socket_established();
+        let repr = TcpRepr {
+            control: TcpControl::Fin, seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1), payload: b"done", ..SEND_TEMPL
+        };
+        let _ = send(&mut exchanged, Instant::from_millis(0), &repr);
+        let _ = send(&mut copied, Instant::from_millis(0), &repr);
+        let mut received = exchanged.exchange_receive_buffer(SocketBuffer::new(vec![0; 64]), 4).unwrap();
+        let mut a = [0; 4];
+        let mut b = [0; 4];
+        assert_eq!(received.dequeue_slice(&mut a), 4);
+        assert_eq!(copied.recv_slice(&mut b), Ok(4));
+        assert_eq!(a, b);
+        assert_eq!(exchanged.remote_seq_no, copied.remote_seq_no);
+        assert_eq!(exchanged.scaled_window(), copied.scaled_window());
+        assert_eq!(exchanged.state(), copied.state());
+        assert_eq!(exchanged.recv_slice(&mut a), Err(RecvError::Finished));
+        recv(&mut exchanged, Instant::from_millis(10), |a| {
+            recv(&mut copied, Instant::from_millis(10), |b| assert_eq!(a, b));
+        });
+    }
+
+    #[cfg(feature = "tcp-align-empty-rx")]
+    #[test]
+    fn test_align_empty_receive_preserves_holes_and_matches_source() {
+        for prefix in 1..8 {
+            for shift in 0..8 {
+                for out_of_order in [false, true] {
+                    let mut s = socket_established_with_buffer_sizes(64, 32);
+                    let mut storage = [0; 32];
+                    storage[shift..shift + 15].copy_from_slice(b"abcdefghijklmno");
+                    let payload = &storage[shift..shift + 15];
+                    let repr = |seq, payload| TcpRepr {
+                        seq_number: REMOTE_SEQ + seq,
+                        ack_number: Some(LOCAL_SEQ + 1), payload, ..SEND_TEMPL
+                    };
+                    let _ = send(&mut s, Instant::from_millis(0), &repr(1, &b"1234567"[..prefix]));
+                    if out_of_order {
+                        let _ = send(&mut s, Instant::from_millis(1), &repr(1 + prefix + 3, &payload[3..8]));
+                    }
+                    let mut consumed = [0; 7];
+                    assert_eq!(s.recv_slice(&mut consumed[..prefix]), Ok(prefix));
+                    assert_eq!(&consumed[..prefix], &b"1234567"[..prefix]);
+                    let origin = s.rx_buffer.get_unallocated(0, 1).as_ptr();
+                    if out_of_order {
+                        assert!(!s.assembler.is_empty());
+                        let _ = send(&mut s, Instant::from_millis(2), &repr(1 + prefix + 8, &payload[8..]));
+                        let _ = send(&mut s, Instant::from_millis(3), &repr(1 + prefix, &payload[..3]));
+                    } else {
+                        let _ = send(&mut s, Instant::from_millis(1), &repr(1 + prefix, payload));
+                    }
+                    assert_eq!(s.recv_queue(), 15);
+                    s.recv(|bytes| {
+                        assert_eq!(bytes, payload);
+                        if out_of_order { assert_eq!(bytes.as_ptr(), origin); }
+                        else {
+                            let mask = core::mem::align_of::<usize>() - 1;
+                            assert_eq!(bytes.as_ptr() as usize & mask, payload.as_ptr() as usize & mask);
+                        }
+                        (15, ())
+                    }).unwrap();
+                    assert!(s.assembler.is_empty());
+                }
+            }
+        }
     }
 
     #[test]

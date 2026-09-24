@@ -8,6 +8,15 @@ impl InterfaceInner {
         frame: &'frame [u8],
         fragments: &'frame mut FragmentsBuffer,
     ) -> Option<EthernetPacket<'frame>> {
+        self.process_ethernet_payload(sockets, meta, frame, fragments,
+            #[cfg(feature = "tcp-gro-receive")] None)
+    }
+
+    pub(super) fn process_ethernet_payload<'frame>(
+        &mut self, sockets: &mut SocketSet, meta: crate::phy::PacketMeta,
+        frame: &'frame [u8], fragments: &'frame mut FragmentsBuffer,
+        #[cfg(feature = "tcp-gro-receive")] gro: Option<&crate::phy::TcpGro<'frame>>,
+    ) -> Option<EthernetPacket<'frame>> {
         let eth_frame = check!(EthernetFrame::new_checked(frame));
 
         // Ignore any packets not directed to our hardware address or any of the multicast groups.
@@ -25,12 +34,13 @@ impl InterfaceInner {
             EthernetProtocol::Ipv4 => {
                 let ipv4_packet = check!(Ipv4Packet::new_checked(eth_frame.payload()));
 
-                self.process_ipv4(
+                self.process_ipv4_payload(
                     sockets,
                     meta,
                     eth_frame.src_addr().into(),
                     &ipv4_packet,
                     fragments,
+                    #[cfg(feature = "tcp-gro-receive")] gro,
                 )
                 .map(EthernetPacket::Ip)
             }
