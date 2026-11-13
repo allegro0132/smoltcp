@@ -364,6 +364,20 @@ impl<'a> Socket<'a> {
             buffer.copy_from_slice(payload);
         }
 
+        // A selected server owns REQUESTING and unicast RENEWING replies.
+        // REBINDING deliberately allows another authoritative server.
+        match &self.state {
+            ClientState::Requesting(state) if server_identifier != state.server.identifier => {
+                return;
+            }
+            ClientState::Renewing(state)
+                if !state.rebinding && server_identifier != state.config.server.identifier =>
+            {
+                return;
+            }
+            _ => {}
+        }
+
         match (&mut self.state, dhcp_repr.message_type) {
             (ClientState::Discovering(_state), DhcpMessageType::Offer) => {
                 if !dhcp_repr.your_ip.x_is_unicast() {
@@ -375,7 +389,7 @@ impl<'a> Socket<'a> {
                     retry_at: cx.now(),
                     retry: 0,
                     server: ServerInfo {
-                        address: src_ip,
+                        address: server_identifier,
                         identifier: server_identifier,
                     },
                     requested_ip: dhcp_repr.your_ip, // use the offered ip
@@ -405,7 +419,14 @@ impl<'a> Socket<'a> {
                     cx.now(),
                     &dhcp_repr,
                     self.max_lease_duration,
-                    state.config.server,
+                    if state.rebinding {
+                        ServerInfo {
+                            address: server_identifier,
+                            identifier: server_identifier,
+                        }
+                    } else {
+                        state.config.server
+                    },
                 ) {
                     state.renew_at = renew_at;
                     state.rebind_at = rebind_at;
