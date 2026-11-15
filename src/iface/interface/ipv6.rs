@@ -457,7 +457,9 @@ impl InterfaceInner {
                 target_addr,
                 flags,
             } => {
-                let ip_addr = ip_repr.src_addr.into();
+                // RFC 4861 section 7.2.5 keys advertisements by the Target Address.
+                // The sender may use a different address assigned to its interface.
+                let ip_addr = target_addr.into();
                 if let Some(lladdr) = lladdr {
                     let lladdr = check!(lladdr.parse(self.caps.medium));
                     if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
