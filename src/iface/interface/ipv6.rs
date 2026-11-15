@@ -222,7 +222,7 @@ impl InterfaceInner {
                 return None;
             }
 
-            if self
+            if !self.any_ip || self
                 .routes
                 .lookup(&IpAddress::Ipv6(ipv6_repr.dst_addr), self.now)
                 .is_none_or(|router_addr| !self.has_ip_addr(router_addr))
@@ -232,8 +232,6 @@ impl InterfaceInner {
                 return None;
             }
 
-            net_trace!("Rejecting IPv6 packet; no assigned address");
-            return None;
         }
 
         #[cfg(feature = "socket-raw")]
