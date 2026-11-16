@@ -105,7 +105,7 @@ impl<'a, Rx: phy::RxToken, FRx: Fuzzer> phy::RxToken for RxToken<'a, Rx, FRx> {
     }
 
     fn meta(&self) -> phy::PacketMeta {
-        self.token.meta()
+        { let mut meta = self.token.meta(); meta.rx_tcp_checksum_verified = false; meta }
     }
 }
 

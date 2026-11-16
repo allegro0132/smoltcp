@@ -282,7 +282,9 @@ impl<'a> phy::RxToken for RxToken<'a> {
     }
 
     fn meta(&self) -> phy::PacketMeta {
-        self.meta
+        let mut meta = self.meta;
+        meta.rx_tcp_checksum_verified = false;
+        meta
     }
 }
 

@@ -168,6 +168,10 @@ pub const IPV4_FRAGMENT_PAYLOAD_ALIGNMENT: usize = 8;
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct PacketMeta {
+    /// RX-only proof from the device for this complete, unmodified TCP packet.
+    /// It never disables IPv4 header validation or validation of other packets.
+    /// Devices must not assert this for fragments or unsupported encapsulation.
+    pub rx_tcp_checksum_verified: bool,
     /// Logical IPv4/TCP data request. The device must segment before transmission,
     /// preserving TCP sequence/PSH and generating each segment's checksums.
     #[cfg(feature = "tcp-segmentation")]

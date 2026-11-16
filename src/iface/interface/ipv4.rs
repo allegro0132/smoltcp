@@ -245,6 +245,7 @@ impl InterfaceInner {
             #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => {
                 self.process_tcp_payload(sockets, handled_by_raw_socket, ip_repr, ip_payload,
+                    meta.rx_tcp_checksum_verified && !ipv4_packet.more_frags() && ipv4_packet.frag_offset() == 0,
                     #[cfg(feature = "tcp-gro-receive")] gro)
             }
 

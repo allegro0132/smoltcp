@@ -341,7 +341,9 @@ impl InterfaceInner {
 
             #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => {
-                self.process_tcp(sockets, handled_by_raw_socket, ipv6_repr.into(), ip_payload)
+                self.process_tcp_payload(sockets, handled_by_raw_socket, ipv6_repr.into(), ip_payload,
+                    meta.rx_tcp_checksum_verified && ipv6_repr.next_header == IpProtocol::Tcp,
+                    #[cfg(feature = "tcp-gro-receive")] None)
             }
 
             #[cfg(feature = "socket-raw")]

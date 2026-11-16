@@ -1481,10 +1481,14 @@ impl InterfaceInner {
             #[cfg(feature = "proto-ipv6")]
             IpRepr::Ipv6(_) => {
                 // Check if we need to fragment it.
-                if total_ip_len > self.caps.ip_mtu() {
+                let oversized = total_ip_len > self.caps.ip_mtu();
+                #[cfg(feature = "segmentation-offload")]
+                let oversized = oversized && meta.segmentation_offload_size.is_none();
+                if oversized {
                     net_debug!("IPv6 fragmentation support is unimplemented. Dropping.");
                     Ok(())
                 } else {
+                    tx_token.set_meta(meta);
                     tx_token.consume(total_len, |mut tx_buffer| {
                         #[cfg(feature = "medium-ethernet")]
                         if matches!(self.caps.medium, Medium::Ethernet) {

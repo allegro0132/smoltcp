@@ -10,13 +10,13 @@ impl InterfaceInner {
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
-        self.process_tcp_payload(sockets, handled_by_raw_socket, ip_repr, ip_payload,
+        self.process_tcp_payload(sockets, handled_by_raw_socket, ip_repr, ip_payload, false,
             #[cfg(feature = "tcp-gro-receive")] None)
     }
 
     pub(crate) fn process_tcp_payload<'frame>(
         &mut self, sockets: &mut SocketSet, handled_by_raw_socket: bool,
-        ip_repr: IpRepr, ip_payload: &'frame [u8],
+        ip_repr: IpRepr, ip_payload: &'frame [u8], checksum_verified: bool,
         #[cfg(feature = "tcp-gro-receive")] gro: Option<&crate::phy::TcpGro<'frame>>,
     ) -> Option<Packet<'frame>> {
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
@@ -31,11 +31,15 @@ impl InterfaceInner {
         }
 
         let tcp_packet = check!(TcpPacket::new_checked(ip_payload));
+        let mut checksum = self.caps.checksum.clone();
+        if checksum_verified {
+            checksum.tcp = if checksum.tcp.tx() { crate::phy::Checksum::Tx } else { crate::phy::Checksum::None };
+        }
         let tcp_repr = check!(TcpRepr::parse(
             &tcp_packet,
             &src_addr,
             &dst_addr,
-            &self.caps.checksum
+            &checksum
         ));
 
         for tcp_socket in sockets

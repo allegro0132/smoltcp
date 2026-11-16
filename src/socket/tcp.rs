@@ -2711,8 +2711,6 @@ impl<'a> Socket<'a> {
                     repr.seq_number = self.local_seq_no;
                     repr.payload = self.tx_buffer.get_allocated(0, size);
 
-                    self.pending_fast_retransmit = false;
-
                     0
                 } else {
                     // Right edge of window, ie the max sequence number we're allowed to send.
@@ -2872,6 +2870,14 @@ impl<'a> Socket<'a> {
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
         emit(cx, packet_meta, (ip_repr, repr))?;
+
+        // The device may reject a submission while its bounded TX queue is
+        // full. Keep the retry obligation until emit actually accepts it:
+        // dispatch already consumed FastRetransmit above, so clearing this
+        // flag before emit can leave outstanding data without any retry timer.
+        if !repr.payload.is_empty() {
+            self.pending_fast_retransmit = false;
+        }
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
@@ -7026,6 +7032,37 @@ mod test {
     }
 
     #[test]
+    fn test_fast_retransmit_survives_exhausted_device() {
+        let mut s = socket_established();
+        s.remote_mss = 3;
+        s.send_slice(b"aaaBBBcccDDD").unwrap();
+        for _ in 0..4 {
+            recv(&mut s, Instant::ZERO, |r| { assert!(r.is_ok()); });
+        }
+        let frontier = s.remote_last_seq;
+        s.timer.set_for_fast_retransmit();
+        // Both full device queues and failed neighbor resolution reject emit.
+        for _ in 0..3 {
+            let rejected: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _, (_, tcp)| {
+                assert_eq!(tcp.seq_number, LOCAL_SEQ + 1);
+                assert_eq!(tcp.payload, b"aaa");
+                Err(())
+            });
+            assert_eq!(rejected, Err(()));
+            assert!(s.pending_fast_retransmit);
+            assert_eq!(s.remote_last_seq, frontier);
+        }
+        recv(&mut s, Instant::ZERO, |r| {
+            let tcp = r.unwrap();
+            assert_eq!(tcp.seq_number, LOCAL_SEQ + 1);
+            assert_eq!(tcp.payload, b"aaa");
+        });
+        assert!(!s.pending_fast_retransmit);
+        assert!(s.timer.is_retransmit());
+        assert_eq!(s.remote_last_seq, frontier);
+    }
+
+    #[test]
     fn test_fast_retransmit_after_triple_duplicate_ack() {
         let mut s = socket_established();
         s.remote_mss = 3;
@@ -7672,6 +7709,8 @@ mod test {
             ..socket_listen()
         };
         s.tx_buffer = SocketBuffer::new(vec![0; 2 * MAX_SEGMENTABLE_SIZE]);
+        // Isolate the device segmentation limit from the initial Reno window.
+        s.set_congestion_control(CongestionControl::None);
 
         send!(
             s,

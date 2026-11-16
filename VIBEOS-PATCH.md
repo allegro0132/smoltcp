@@ -73,3 +73,18 @@ cargo test --lib --no-default-features \
 
 Keep this patch explicit when rebasing the fork; do not drop it without
 rerunning these failure-reproducing tests.
+
+## Per-packet receive TCP checksum proof
+
+`PacketMeta::rx_tcp_checksum_verified` is an RX-only device assertion for the
+exact received bytes. TCP parsing may skip that packet's checksum without
+changing the interface's checksum capabilities. IPv4 header checks remain
+active; IPv4 fragments and IPv6 extension-header traffic do not consume this
+proof. Mutating fault/fuzz device wrappers clear it. TX paths do not use it.
+
+The vibewrt proxy binds proof to an owned receive buffer and drops it on reuse
+or software materialization. Its integration test
+`rx_checksum_proof_is_per_packet_and_never_recycled` covers IPv4 and IPv6,
+consecutive unverified/verified/unverified packets, invalid IPv4 headers and
+buffer recycling. NETSYS hardware qualification and remaining LRO constraints
+are recorded in vibewrt `docs/MT7988A_RX_OFFLOAD.md`.
