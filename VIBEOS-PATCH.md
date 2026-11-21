@@ -88,3 +88,22 @@ or software materialization. Its integration test
 consecutive unverified/verified/unverified packets, invalid IPv4 headers and
 buffer recycling. NETSYS hardware qualification and remaining LRO constraints
 are recorded in vibewrt `docs/MT7988A_RX_OFFLOAD.md`.
+
+## TCP recovery after a partial ACK
+
+Fast retransmit records the highest sequence sent in that flight. An advancing
+ACK below this point schedules the next missing segment for retransmission.
+The sender clears the recovery point on a covering ACK, a retransmission
+timeout or socket reset. This prevents a one-second stall when the receiver
+already holds the rest of the flight and has no more duplicate ACKs to send.
+
+The regression test `partial_ack_recovers_next_loss_without_waiting_for_rto`
+covers two losses in the same flight and verifies that retrying the second
+segment preserves the send frontier.
+
+A receiver may report a later SACK block only once. If the sender already
+has an RTT estimate, that report gives a hole one smoothed RTT (at least
+10 ms) to fill. Repeated reports leave the deadline in place. A cumulative
+ACK that fills the hole cancels it. If the hole persists, the ordinary fast
+retransmit path handles the loss. Reports outside the transmitted flight and
+duplicate SACK blocks below the cumulative ACK cannot arm this deadline.

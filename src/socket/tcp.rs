@@ -525,6 +525,10 @@ pub struct Socket<'a> {
     local_rx_dup_acks: u8,
     /// If a fast retransmit needs to occur
     pending_fast_retransmit: bool,
+    /// End of the flight for which fast retransmit was entered (serial arithmetic).
+    fast_recovery_end: Option<TcpSeqNumber>,
+    /// Reordering grace period after the peer SACKs bytes above SND.UNA.
+    sack_gap_deadline: Option<Instant>,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -616,6 +620,8 @@ impl<'a> Socket<'a> {
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
             pending_fast_retransmit: false,
+            fast_recovery_end: None,
+            sack_gap_deadline: None,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -910,6 +916,11 @@ impl<'a> Socket<'a> {
         self.state = State::Closed;
         self.timer = Timer::new();
         self.rtte = RttEstimator::default();
+        self.pending_fast_retransmit = false;
+        self.fast_recovery_end = None;
+        self.sack_gap_deadline = None;
+        self.local_rx_dup_acks = 0;
+        self.local_rx_last_ack = None;
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
         self.rx_buffer.clear();
@@ -2216,6 +2227,35 @@ impl<'a> Socket<'a> {
 
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
+            // A small out-of-order burst may result in only one SACK report.
+            // Arm once for this cumulative ACK. A later ACK cancels the old
+            // gap, and duplicate reports must not postpone its deadline.
+            if ack_len > 0 || new_remote_win_len == 0 {
+                self.sack_gap_deadline = None;
+            }
+            if self.sack_gap_deadline.is_none() && self.fast_recovery_end.is_none()
+                && self.remote_has_sack && self.rtte.have_measurement
+                && new_remote_win_len != 0 && ack_number < self.remote_last_seq
+                && repr.sack_ranges.iter().flatten().any(|&(left, right)| {
+                    let start = left.wrapping_sub(ack_number.0 as u32);
+                    let end = right.wrapping_sub(ack_number.0 as u32);
+                    start > 0 && start < end && end as usize <= self.remote_last_seq - ack_number
+                })
+            {
+                let grace = Duration::from_millis(u64::from(self.rtte.srtt.max(10)));
+                self.sack_gap_deadline = Some(cx.now() + grace);
+            }
+            if let Some(end) = self.fast_recovery_end {
+                if ack_number >= end {
+                    self.fast_recovery_end = None;
+                    self.pending_fast_retransmit = false;
+                } else if ack_len > 0 {
+                    // A partial ACK after fast retransmit exposes the next loss
+                    // in the same flight. The peer may already hold all later
+                    // segments, so no further duplicate ACKs need arrive.
+                    self.pending_fast_retransmit = new_remote_win_len != 0;
+                }
+            }
             self.local_seq_no = ack_number;
 
             // During retransmission, if an earlier segment got lost but later was
@@ -2541,12 +2581,22 @@ impl<'a> Socket<'a> {
             .inner_mut()
             .pre_transmit(cx.now());
 
+        if self.sack_gap_deadline.is_some_and(|at| cx.now() >= at) {
+            self.sack_gap_deadline = None;
+            if !self.timer.should_retransmit(cx.now()) && self.timer.is_retransmit()
+                && self.fast_recovery_end.is_none() && self.remote_win_len != 0
+                && self.local_seq_no < self.remote_last_seq {
+                self.timer.set_for_fast_retransmit();
+            }
+        }
+
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
         } else if self.timer.should_retransmit(cx.now()) {
+            self.sack_gap_deadline = None;
             if let Timer::Retransmit { .. } = self.timer {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
                 net_debug!("retransmitting after rto");
@@ -2560,6 +2610,8 @@ impl<'a> Socket<'a> {
                 // Rewind "last sequence number sent", as if we never
                 // had sent them. This will cause all data in the queue
                 // to be sent again.
+                self.fast_recovery_end = None;
+                self.pending_fast_retransmit = false;
                 self.remote_last_seq = self.local_seq_no;
 
                 // Inform RTTE, so that it can can handle RTO backoff
@@ -2574,6 +2626,7 @@ impl<'a> Socket<'a> {
                     .inner_mut()
                     .on_loss(cx.now(), in_flight);
 
+                self.fast_recovery_end.get_or_insert(self.remote_last_seq);
                 self.pending_fast_retransmit = true;
             }
 
@@ -2982,7 +3035,8 @@ impl<'a> Socket<'a> {
             };
 
             // We wait for the earliest of our timers to fire.
-            *[self.timer.poll_at(), timeout_poll_at, delayed_ack_poll_at]
+            let gap_poll_at = self.sack_gap_deadline.map_or(PollAt::Ingress, PollAt::Time);
+            *[self.timer.poll_at(), timeout_poll_at, delayed_ack_poll_at, gap_poll_at]
                 .iter()
                 .min()
                 .unwrap_or(&PollAt::Ingress)
@@ -7060,6 +7114,88 @@ mod test {
         assert!(!s.pending_fast_retransmit);
         assert!(s.timer.is_retransmit());
         assert_eq!(s.remote_last_seq, frontier);
+    }
+
+    #[test]
+    fn sparse_sack_waits_for_reordering_then_recovers_the_gap() {
+        for gap_filled in [false, true] {
+            let mut s = socket_established();
+            s.remote_has_sack = true;
+            s.rtte.sample(4);
+            s.remote_mss = 3;
+            s.send_slice(b"aaaBBBccc").unwrap();
+            for _ in 0..3 {
+                recv(&mut s, Instant::ZERO, |r| assert!(r.is_ok()));
+            }
+            let report = TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                sack_ranges: [Some(((LOCAL_SEQ + 7).0 as u32, (LOCAL_SEQ + 10).0 as u32)), None, None],
+                ..SEND_TEMPL
+            };
+            send!(s, time 1, report);
+            send!(s, time 5, report);
+            recv_nothing!(s, time 9);
+            if gap_filled {
+                send!(s, time 10, TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 10),
+                    ..SEND_TEMPL
+                });
+                recv_nothing!(s, time 11);
+            } else {
+                recv(&mut s, Instant::from_millis(11), |r| assert_eq!(r.unwrap().payload, b"aaa"));
+            }
+        }
+    }
+
+    #[test]
+    fn stale_and_unsent_sack_blocks_do_not_start_recovery() {
+        let mut s = socket_established();
+        s.remote_has_sack = true;
+        s.rtte.sample(4);
+        s.send_slice(b"abc").unwrap();
+        recv(&mut s, Instant::ZERO, |r| assert_eq!(r.unwrap().payload, b"abc"));
+        for (left, right) in [(0, 1), (2, 20), (3, 2)] {
+            send!(s, time 1, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                sack_ranges: [Some(((LOCAL_SEQ + left).0 as u32, (LOCAL_SEQ + right).0 as u32)), None, None],
+                ..SEND_TEMPL
+            });
+            assert!(s.sack_gap_deadline.is_none());
+        }
+    }
+
+    #[test]
+    fn partial_ack_recovers_next_loss_without_waiting_for_rto() {
+        let mut s = socket_established();
+        s.remote_mss = 3;
+        s.send_slice(b"aaaBBBcccDDD").unwrap();
+        for _ in 0..4 {
+            recv(&mut s, Instant::ZERO, |r| assert!(r.is_ok()));
+        }
+        let end = s.remote_last_seq;
+        s.timer.set_for_fast_retransmit();
+        recv(&mut s, Instant::ZERO, |r| assert_eq!(r.unwrap().payload, b"aaa"));
+        send!(s, time 1, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 4),
+            ..SEND_TEMPL
+        });
+        recv(&mut s, Instant::from_millis(2), |r| {
+            let packet = r.unwrap();
+            assert_eq!(packet.seq_number, LOCAL_SEQ + 4);
+            assert_eq!(packet.payload, b"BBB");
+        });
+        assert_eq!(s.remote_last_seq, end);
+        send!(s, time 3, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(end),
+            ..SEND_TEMPL
+        });
+        assert!(s.fast_recovery_end.is_none());
+        assert!(!s.pending_fast_retransmit);
     }
 
     #[test]
