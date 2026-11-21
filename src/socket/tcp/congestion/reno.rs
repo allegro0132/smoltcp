@@ -11,6 +11,8 @@ pub struct Reno {
     mss: usize,
     ssthresh: usize,
     rwnd: usize,
+    /// Newly acknowledged bytes toward the next congestion-avoidance increase.
+    ca_acked: usize,
 
     in_fast_recovery: bool,
     // Set on RTO, cleared when new data is ACKed. While set, further RTOs
@@ -26,6 +28,7 @@ impl Reno {
             mss: DEFAULT_MSS,
             ssthresh: usize::MAX,
             rwnd: 64 * DEFAULT_MSS,
+            ca_acked: 0,
             in_fast_recovery: false,
             in_rto_recovery: false,
         }
@@ -60,11 +63,31 @@ impl Controller for Reno {
             // Slow start: increase `cwnd` by 1 MSS per ACK.
             len.min(self.mss)
         } else {
-            // Congestion avoidance: increase by ~1 MSS per RTT.
-            (self.mss * self.mss / self.cwnd).max(1)
+            // RFC 5681 section 3.1: count new bytes, including cumulative
+            // ACKs. A window of delivered data earns one MSS of growth.
+            self.ca_acked = self.ca_acked.saturating_add(len.min(self.cwnd));
+            if self.ca_acked < self.cwnd {
+                return;
+            }
+            self.ca_acked -= self.cwnd;
+            self.mss
         };
 
         self.cwnd = self.cwnd.saturating_add(inc).min(self.rwnd).max(self.mss);
+    }
+
+    fn on_partial_ack(&mut self, now: Instant, len: usize, in_flight: usize, rtt: &RttEstimator) {
+        if !self.in_fast_recovery {
+            self.on_ack(now, len, in_flight, rtt);
+            return;
+        }
+        // RFC 6582 section 3.2: partially deflate the window and retain
+        // recovery until a cumulative ACK covers the original flight.
+        self.cwnd = self.cwnd.saturating_sub(len);
+        if len >= self.mss {
+            self.cwnd = self.cwnd.saturating_add(self.mss);
+        }
+        self.cwnd = self.cwnd.max(self.mss);
     }
 
     fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
@@ -76,6 +99,7 @@ impl Controller for Reno {
     fn on_loss(&mut self, _now: Instant, in_flight: usize) {
         // Only cut window size on first entrance to fast recovery.
         if !self.in_fast_recovery {
+            self.ca_acked = 0;
             self.ssthresh = (in_flight >> 1).max(2 * self.mss);
             self.cwnd = self.ssthresh.min(self.rwnd).saturating_add(3 * self.mss);
 
@@ -93,6 +117,7 @@ impl Controller for Reno {
         }
 
         // cwnd collapses to the loss window (1 MSS) and we re-enter slow start.
+        self.ca_acked = 0;
         self.cwnd = self.mss;
 
         // Major loss has occurred, ensure we move from fast recovery (if in it) to slow start.
@@ -142,8 +167,23 @@ mod test {
 
         // CA should cap at the receive window
         reno.cwnd = reno.rwnd - 1;
-        ack(&mut reno, MSS, Instant::from_millis(20));
+        let window = reno.cwnd;
+        ack(&mut reno, window, Instant::from_millis(20));
         assert_eq!(reno.window(), reno.rwnd);
+    }
+
+    #[test]
+    fn cumulative_and_split_acks_earn_the_same_window_increase() {
+        for chunk in [1, MSS, 8 * MSS, 32 * MSS] {
+            let mut reno = Reno::new();
+            reno.cwnd = 32 * MSS;
+            reno.ssthresh = 16 * MSS;
+            for _ in 0..32 * MSS / chunk {
+                ack(&mut reno, chunk, Instant::ZERO);
+            }
+            assert_eq!(reno.cwnd, 33 * MSS);
+            assert_eq!(reno.ca_acked, 0);
+        }
     }
 
     #[test]
@@ -280,8 +320,9 @@ mod test {
         time += 1;
         let initial_cwnd = reno.window();
         ack(&mut reno, MSS, Instant::from_millis(time));
-        assert!(reno.window() > initial_cwnd);
-        assert!(reno.window() < initial_cwnd + MSS);
+        assert_eq!(reno.window(), initial_cwnd);
+        ack(&mut reno, initial_cwnd - MSS, Instant::from_millis(time + 1));
+        assert_eq!(reno.window(), initial_cwnd + MSS);
     }
 
     #[test]
@@ -327,8 +368,23 @@ mod test {
         time += 1;
         let initial_cwnd = reno.window();
         ack(&mut reno, MSS, Instant::from_millis(time));
-        assert!(reno.window() > initial_cwnd);
-        assert!(reno.window() < initial_cwnd + MSS);
+        assert_eq!(reno.window(), initial_cwnd);
+        ack(&mut reno, initial_cwnd - MSS, Instant::from_millis(time + 1));
+        assert_eq!(reno.window(), initial_cwnd + MSS);
+    }
+
+    #[test]
+    fn partial_ack_keeps_the_original_recovery_threshold() {
+        let mut reno = Reno::new();
+        reno.on_loss(Instant::ZERO, 20 * MSS);
+        reno.on_partial_ack(Instant::ZERO, 3 * MSS, 17 * MSS, &rtte());
+        assert!(reno.in_fast_recovery);
+        assert_eq!(reno.window(), 11 * MSS);
+        reno.on_loss(Instant::ZERO, 17 * MSS);
+        assert_eq!(reno.ssthresh, 10 * MSS);
+        ack(&mut reno, 17 * MSS, Instant::ZERO);
+        assert_eq!(reno.window(), 10 * MSS);
+        assert!(!reno.in_fast_recovery);
     }
 
     #[test]

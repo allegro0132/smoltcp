@@ -529,6 +529,8 @@ pub struct Socket<'a> {
     fast_recovery_end: Option<TcpSeqNumber>,
     /// Reordering grace period after the peer SACKs bytes above SND.UNA.
     sack_gap_deadline: Option<Instant>,
+    /// A valid SACK permits one additional transmission if the first repair is lost.
+    sack_retry_eligible: bool,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -622,6 +624,7 @@ impl<'a> Socket<'a> {
             pending_fast_retransmit: false,
             fast_recovery_end: None,
             sack_gap_deadline: None,
+            sack_retry_eligible: false,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -919,6 +922,7 @@ impl<'a> Socket<'a> {
         self.pending_fast_retransmit = false;
         self.fast_recovery_end = None;
         self.sack_gap_deadline = None;
+        self.sack_retry_eligible = false;
         self.local_rx_dup_acks = 0;
         self.local_rx_last_ack = None;
         self.assembler = Assembler::new();
@@ -2216,12 +2220,12 @@ impl<'a> Socket<'a> {
                     // Notify of fresh ACK
                     self.rtte.on_ack(cx.now(), ack_number);
                     let new_flight_size = self.flight_size().saturating_sub(ack_len);
-                    self.congestion_controller.inner_mut().on_ack(
-                        cx.now(),
-                        ack_len,
-                        new_flight_size,
-                        &self.rtte,
-                    );
+                    let controller = self.congestion_controller.inner_mut();
+                    if ack_len > 0 && self.fast_recovery_end.is_some_and(|end| ack_number < end) {
+                        controller.on_partial_ack(cx.now(), ack_len, new_flight_size, &self.rtte);
+                    } else {
+                        controller.on_ack(cx.now(), ack_len, new_flight_size, &self.rtte);
+                    }
                 }
             };
 
@@ -2231,9 +2235,10 @@ impl<'a> Socket<'a> {
             // Arm once for this cumulative ACK. A later ACK cancels the old
             // gap, and duplicate reports must not postpone its deadline.
             if ack_len > 0 || new_remote_win_len == 0 {
+                self.sack_retry_eligible = false;
                 self.sack_gap_deadline = None;
             }
-            if self.sack_gap_deadline.is_none() && self.fast_recovery_end.is_none()
+            if self.sack_gap_deadline.is_none() && (self.fast_recovery_end.is_none() || ack_len > 0)
                 && self.remote_has_sack && self.rtte.have_measurement
                 && new_remote_win_len != 0 && ack_number < self.remote_last_seq
                 && repr.sack_ranges.iter().flatten().any(|&(left, right)| {
@@ -2242,8 +2247,11 @@ impl<'a> Socket<'a> {
                     start > 0 && start < end && end as usize <= self.remote_last_seq - ack_number
                 })
             {
-                let grace = Duration::from_millis(u64::from(self.rtte.srtt.max(10)));
-                self.sack_gap_deadline = Some(cx.now() + grace);
+                self.sack_retry_eligible = true;
+                if self.fast_recovery_end.is_none() {
+                    let grace = Duration::from_millis(u64::from(self.rtte.srtt.max(10)));
+                    self.sack_gap_deadline = Some(cx.now() + grace);
+                }
             }
             if let Some(end) = self.fast_recovery_end {
                 if ack_number >= end {
@@ -2584,9 +2592,13 @@ impl<'a> Socket<'a> {
         if self.sack_gap_deadline.is_some_and(|at| cx.now() >= at) {
             self.sack_gap_deadline = None;
             if !self.timer.should_retransmit(cx.now()) && self.timer.is_retransmit()
-                && self.fast_recovery_end.is_none() && self.remote_win_len != 0
+                && self.remote_win_len != 0
                 && self.local_seq_no < self.remote_last_seq {
-                self.timer.set_for_fast_retransmit();
+                if self.fast_recovery_end.is_some() {
+                    self.pending_fast_retransmit = true;
+                } else {
+                    self.timer.set_for_fast_retransmit();
+                }
             }
         }
 
@@ -2611,6 +2623,7 @@ impl<'a> Socket<'a> {
                 // had sent them. This will cause all data in the queue
                 // to be sent again.
                 self.fast_recovery_end = None;
+                self.sack_retry_eligible = false;
                 self.pending_fast_retransmit = false;
                 self.remote_last_seq = self.local_seq_no;
 
@@ -2929,6 +2942,14 @@ impl<'a> Socket<'a> {
         // dispatch already consumed FastRetransmit above, so clearing this
         // flag before emit can leave outstanding data without any retry timer.
         if !repr.payload.is_empty() {
+            if self.pending_fast_retransmit && self.sack_retry_eligible {
+                // The receiver can already hold the rest of the flight. If this
+                // repair is lost there may be no more duplicate ACKs to trigger
+                // another. Keep the ordinary RTO running for any further loss.
+                let delay = Duration::from_millis((4 * u64::from(self.rtte.srtt)).max(50));
+                self.sack_gap_deadline = Some(cx.now() + delay);
+                self.sack_retry_eligible = false;
+            }
             self.pending_fast_retransmit = false;
         }
 
@@ -7145,7 +7166,45 @@ mod test {
                 recv_nothing!(s, time 11);
             } else {
                 recv(&mut s, Instant::from_millis(11), |r| assert_eq!(r.unwrap().payload, b"aaa"));
+                let deadline = s.sack_gap_deadline.unwrap();
+                let original_rto = s.timer;
+                recv(&mut s, deadline, |r| assert_eq!(r.unwrap().payload, b"aaa"));
+                assert_eq!(s.timer, original_rto);
+                assert!(s.sack_gap_deadline.is_none());
+                assert!(s.timer.is_retransmit());
+                send!(s, time 70, report);
+                assert!(s.sack_gap_deadline.is_none());
             }
+        }
+    }
+
+    #[test]
+    fn sack_repair_retry_is_cancelled_by_progress_or_a_closed_window() {
+        for close_window in [false, true] {
+            let mut s = socket_established();
+            s.remote_has_sack = true;
+            s.rtte.sample(4);
+            s.remote_mss = 3;
+            s.send_slice(b"aaaBBB").unwrap();
+            for _ in 0..2 {
+                recv(&mut s, Instant::ZERO, |r| assert!(r.is_ok()));
+            }
+            send!(s, time 1, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                sack_ranges: [Some(((LOCAL_SEQ + 4).0 as u32, (LOCAL_SEQ + 7).0 as u32)), None, None],
+                ..SEND_TEMPL
+            });
+            recv(&mut s, Instant::from_millis(11), |r| assert_eq!(r.unwrap().payload, b"aaa"));
+            assert!(s.sack_gap_deadline.is_some());
+            send!(s, time 12, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(if close_window { LOCAL_SEQ + 1 } else { LOCAL_SEQ + 7 }),
+                window_len: if close_window { 0 } else { SEND_TEMPL.window_len },
+                ..SEND_TEMPL
+            });
+            assert!(s.sack_gap_deadline.is_none());
+            assert!(!s.sack_retry_eligible);
         }
     }
 

@@ -107,3 +107,15 @@ has an RTT estimate, that report gives a hole one smoothed RTT (at least
 ACK that fills the hole cancels it. If the hole persists, the ordinary fast
 retransmit path handles the loss. Reports outside the transmitted flight and
 duplicate SACK blocks below the cumulative ACK cannot arm this deadline.
+
+If a SACK-confirmed repair is itself lost, the receiver may have no new
+data to acknowledge. After the device accepts the repair, the sender allows
+one more transmission of the same segment after four smoothed RTTs (at
+least 50 ms). Cumulative progress or a zero window cancels the deadline.
+The additional transmission preserves the running RTO and the send frontier.
+
+Reno congestion avoidance credits the bytes covered by each advancing ACK.
+One acknowledged window earns one MSS of growth, including when the LAN
+receiver aggregates ACKs. Loss clears the saved credit. During fast recovery
+a partial ACK deflates the congestion window and keeps the original recovery
+threshold until a cumulative ACK covers the flight.

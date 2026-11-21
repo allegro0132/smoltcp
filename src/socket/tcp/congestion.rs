@@ -20,6 +20,11 @@ pub(super) trait Controller {
 
     fn on_ack(&mut self, now: Instant, len: usize, in_flight: usize, rtt: &RttEstimator) {}
 
+    /// New data was acknowledged, but part of the original recovery flight remains.
+    fn on_partial_ack(&mut self, now: Instant, len: usize, in_flight: usize, rtt: &RttEstimator) {
+        self.on_ack(now, len, in_flight, rtt);
+    }
+
     /// Fired on each duplicate ack received, after `on_loss` has been called.
     fn on_dup_ack(&mut self, now: Instant, len: usize, in_flight: usize) {}
 
