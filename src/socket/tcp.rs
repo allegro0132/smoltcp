@@ -1380,6 +1380,23 @@ impl<'a> Socket<'a> {
         })
     }
 
+    /// Grow owned receive storage at an empty boundary. An unread prefix or
+    /// out-of-order segment must retain its existing ring position. Established
+    /// sockets keep their sequence numbers and negotiated window scale.
+    #[cfg(feature = "alloc")]
+    pub fn try_grow_empty_receive_buffer(&mut self, capacity: usize) -> bool {
+        if capacity <= self.rx_buffer.capacity() || capacity as u64 > (1 << 30)
+            || !self.rx_buffer.is_empty() || !self.assembler.is_empty()
+        {
+            return false;
+        }
+        let mut bytes = alloc::vec::Vec::new();
+        if bytes.try_reserve_exact(capacity).is_err() { return false; }
+        bytes.resize(capacity, 0);
+        self.rx_buffer = SocketBuffer::new(bytes);
+        true
+    }
+
     /// Exchange all readable bytes for empty storage without copying payloads.
     ///
     /// The replacement must be empty and have the same capacity as the current
@@ -3407,6 +3424,27 @@ mod test {
 
     fn socket_established() -> TestSocket {
         socket_established_with_buffer_sizes(64, 64)
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn growing_an_empty_ring_preserves_tcp_sequence_and_window_scale() {
+        let mut s = socket_established_with_buffer_sizes(32, 32);
+        let sequence = s.remote_seq_no;
+        let shift = s.remote_win_shift;
+        s.rx_buffer.enqueue_slice(b"abc");
+        assert!(!s.try_grow_empty_receive_buffer(128));
+        let mut bytes = [0; 3];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(3));
+        assert_eq!(&bytes, b"abc");
+        s.assembler.add(4, 3).unwrap();
+        assert!(!s.try_grow_empty_receive_buffer(128));
+        s.assembler.clear();
+        assert!(s.try_grow_empty_receive_buffer(128));
+        assert_eq!((s.remote_seq_no, s.remote_win_shift), (sequence + 3, shift));
+        assert_eq!(s.recv_capacity(), 128);
+        assert!(s.window_to_update());
+        assert!(!s.try_grow_empty_receive_buffer(64));
     }
 
     fn socket_fin_wait_1() -> TestSocket {
