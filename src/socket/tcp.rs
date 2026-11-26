@@ -19,6 +19,8 @@ use crate::wire::{
 };
 
 mod congestion;
+#[cfg(feature = "tcp-owned-tx")]
+mod owned_tx;
 mod receive_payload;
 use receive_payload::ReceivePayload;
 
@@ -477,6 +479,8 @@ pub struct Socket<'a> {
     rx_buffer: SocketBuffer<'a>,
     rx_fin_received: bool,
     tx_buffer: SocketBuffer<'a>,
+    #[cfg(feature = "tcp-owned-tx")]
+    owned_tx: owned_tx::Records,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
     /// Interval at which keep-alive packets will be sent.
@@ -505,6 +509,9 @@ pub struct Socket<'a> {
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
+    // Largest receive window the application plans to allocate after the handshake.
+    #[cfg(feature = "alloc")]
+    receive_growth_shift: u8,
     /// The remote window size, relative to local_seq_no
     /// I.e. we're allowed to send octets until local_seq_no+remote_win_len
     remote_win_len: usize,
@@ -600,6 +607,8 @@ impl<'a> Socket<'a> {
             rtte: RttEstimator::default(),
             assembler: Assembler::new(),
             tx_buffer,
+            #[cfg(feature = "tcp-owned-tx")]
+            owned_tx: owned_tx::Records::default(),
             rx_buffer,
             rx_fin_received: false,
             timeout: None,
@@ -614,6 +623,8 @@ impl<'a> Socket<'a> {
             remote_last_win: 0,
             remote_win_len: 0,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
+            #[cfg(feature = "alloc")]
+            receive_growth_shift: 0,
             remote_win_scale: None,
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
@@ -927,6 +938,8 @@ impl<'a> Socket<'a> {
         self.local_rx_last_ack = None;
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
+        #[cfg(feature = "tcp-owned-tx")]
+        { self.owned_tx = owned_tx::Records::default(); }
         self.rx_buffer.clear();
         self.rx_fin_received = false;
         self.listen_endpoint = IpListenEndpoint::default();
@@ -939,6 +952,8 @@ impl<'a> Socket<'a> {
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
+        #[cfg(feature = "alloc")]
+        { self.remote_win_shift = self.remote_win_shift.max(self.receive_growth_shift); }
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
@@ -1291,6 +1306,26 @@ impl<'a> Socket<'a> {
         Ok(result)
     }
 
+    /// Transfer a whole immutable buffer to TCP until its bytes are acknowledged
+    /// or the socket is dropped/reset. Successful admission empties `data`.
+    /// Backpressure returns false and leaves ownership with the caller.
+    /// `release` can wipe the payload before its allocation is freed.
+    #[cfg(feature = "tcp-owned-tx")]
+    pub fn send_owned(&mut self, data: &mut alloc::vec::Vec<u8>, release: fn(&mut [u8])) -> Result<bool, SendError> {
+        let len = data.len();
+        let queued = self.tx_buffer.len();
+        let room = len > 0 && len <= self.tx_buffer.window() && self.owned_tx.reserve();
+        let accepted = self.send_impl(|ring| {
+            if !room { return (0, false); }
+            ring.enqueue_unallocated(len);
+            (len, true)
+        })?;
+        if accepted {
+            self.owned_tx.push(queued, core::mem::take(data), release);
+        }
+        Ok(accepted)
+    }
+
     /// Call `f` with the largest contiguous slice of octets in the transmit buffer,
     /// and enqueue the amount of elements returned by `f`.
     ///
@@ -1380,20 +1415,40 @@ impl<'a> Socket<'a> {
         })
     }
 
-    /// Grow owned receive storage at an empty boundary. An unread prefix or
-    /// out-of-order segment must retain its existing ring position. Established
-    /// sockets keep their sequence numbers and negotiated window scale.
+    /// Reserve TCP window-scale bits before connecting or listening. The advertised
+    /// window still uses the free space in the current ring on every segment.
+    #[cfg(feature = "alloc")]
+    pub fn plan_receive_growth(&mut self, capacity: usize) -> bool {
+        if self.state != State::Closed || capacity < self.rx_buffer.capacity() || capacity as u64 > (1 << 30) {
+            return false;
+        }
+        let bits = usize::BITS - capacity.leading_zeros();
+        self.receive_growth_shift = bits.saturating_sub(16).min(14) as u8;
+        true
+    }
+
+    /// Grow only at an empty receive boundary, keeping all negotiated TCP state.
     #[cfg(feature = "alloc")]
     pub fn try_grow_empty_receive_buffer(&mut self, capacity: usize) -> bool {
-        if capacity <= self.rx_buffer.capacity() || capacity as u64 > (1 << 30)
-            || !self.rx_buffer.is_empty() || !self.assembler.is_empty()
-        {
+        self.rx_buffer.is_empty() && self.try_grow_receive_buffer(capacity)
+    }
+
+    /// Grow the receive ring, preserving its unread sequence and the negotiated
+    /// scale. Outstanding out-of-order data keeps its current backing storage.
+    #[cfg(feature = "alloc")]
+    pub fn try_grow_receive_buffer(&mut self, capacity: usize) -> bool {
+        if capacity <= self.rx_buffer.capacity() || capacity as u64 > (1 << 30) || !self.assembler.is_empty() {
             return false;
         }
         let mut bytes = alloc::vec::Vec::new();
         if bytes.try_reserve_exact(capacity).is_err() { return false; }
         bytes.resize(capacity, 0);
-        self.rx_buffer = SocketBuffer::new(bytes);
+        let unread = self.rx_buffer.len();
+        let copied = self.rx_buffer.read_allocated(0, &mut bytes[..unread]);
+        debug_assert_eq!(copied, unread);
+        let mut grown = SocketBuffer::new(bytes);
+        grown.enqueue_unallocated(unread);
+        self.rx_buffer = grown;
         true
     }
 
@@ -2177,6 +2232,8 @@ impl<'a> Socket<'a> {
                 self.tx_buffer.len() - ack_len
             );
             self.tx_buffer.dequeue_allocated(ack_len);
+            #[cfg(feature = "tcp-owned-tx")]
+            self.owned_tx.acknowledge(ack_len);
 
             // There's new room available in tx_buffer, wake the waiting task if any.
             #[cfg(feature = "async")]
@@ -2792,7 +2849,10 @@ impl<'a> Socket<'a> {
                 let offset = if self.pending_fast_retransmit {
                     let size = effective_mss.min(self.tx_buffer.len());
                     repr.seq_number = self.local_seq_no;
-                    repr.payload = self.tx_buffer.get_allocated(0, size);
+                    #[cfg(feature = "tcp-owned-tx")]
+                    { repr.payload = self.owned_tx.payload(&self.tx_buffer, 0, size); }
+                    #[cfg(not(feature = "tcp-owned-tx"))]
+                    { repr.payload = self.tx_buffer.get_allocated(0, size); }
 
                     0
                 } else {
@@ -2869,7 +2929,10 @@ impl<'a> Socket<'a> {
                     };
 
                     let offset = self.flight_size();
-                    repr.payload = self.tx_buffer.get_allocated(offset, size);
+                    #[cfg(feature = "tcp-owned-tx")]
+                    { repr.payload = self.owned_tx.payload(&self.tx_buffer, offset, size); }
+                    #[cfg(not(feature = "tcp-owned-tx"))]
+                    { repr.payload = self.tx_buffer.get_allocated(offset, size); }
 
                     #[cfg(feature = "segmentation-offload")]
                     if repr.payload.len() > effective_mss {
@@ -3424,6 +3487,30 @@ mod test {
 
     fn socket_established() -> TestSocket {
         socket_established_with_buffer_sizes(64, 64)
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn planned_window_growth_preserves_wrapped_unread_bytes() {
+        let mut s = socket_with_buffer_sizes(32, 8);
+        assert!(s.plan_receive_growth(128 * 1024));
+        s.reset();
+        s.state = State::Established;
+        assert_eq!(s.remote_win_shift, 2);
+        assert!(!s.plan_receive_growth(1024 * 1024));
+        let seq = s.remote_seq_no;
+        s.rx_buffer.enqueue_slice(b"abcdef");
+        let mut consumed = [0; 5];
+        assert_eq!(s.recv_slice(&mut consumed), Ok(5));
+        s.rx_buffer.enqueue_slice(b"GHIJ");
+        s.assembler.add(2, 1).unwrap();
+        assert!(!s.try_grow_receive_buffer(128 * 1024));
+        s.assembler.clear();
+        assert!(s.try_grow_receive_buffer(128 * 1024));
+        assert_eq!(s.remote_seq_no, seq + 5);
+        assert_eq!(s.remote_win_shift, 2);
+        assert_eq!(s.recv_slice(&mut consumed), Ok(5));
+        assert_eq!(&consumed, b"fGHIJ");
     }
 
     #[cfg(feature = "alloc")]
@@ -5009,6 +5096,33 @@ mod test {
             }
         );
         assert_eq!(s.tx_buffer.len(), 0);
+    }
+
+    #[cfg(feature = "tcp-owned-tx")]
+    #[test]
+    fn owned_send_keeps_data_on_decline_and_releases_on_ack() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static RELEASED: AtomicBool = AtomicBool::new(false);
+        let mut s = socket_established_with_buffer_sizes(6, 64);
+        let mut bytes = b"abcdef".to_vec();
+        assert!(s.send_owned(&mut bytes, |data| {
+            assert_eq!(data, b"abcdef");
+            RELEASED.store(true, Ordering::Relaxed);
+        }).unwrap());
+        assert!(bytes.is_empty());
+        let mut second = b"next".to_vec();
+        assert!(!s.send_owned(&mut second, |_| {}).unwrap());
+        assert_eq!(second, b"next");
+        recv!(s, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1, ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"abcdef", ..RECV_TEMPL
+        }]);
+        send!(s, TcpRepr { seq_number: REMOTE_SEQ + 1, ack_number: Some(LOCAL_SEQ + 4), ..SEND_TEMPL });
+        assert!(!RELEASED.load(Ordering::Relaxed));
+        assert_eq!(s.send_queue(), 3);
+        send!(s, TcpRepr { seq_number: REMOTE_SEQ + 1, ack_number: Some(LOCAL_SEQ + 7), ..SEND_TEMPL });
+        assert!(RELEASED.load(Ordering::Relaxed));
+        assert_eq!(s.send_queue(), 0);
     }
 
     #[test]

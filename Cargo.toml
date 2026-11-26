@@ -41,6 +41,7 @@ idna = { version = "=1.0.1" }
 
 [features]
 tcp-gro-full-batch = ["tcp-gro-wide"]
+tcp-owned-tx = ["socket-tcp", "alloc"]
 tcp-gro-wide = ["tcp-gro-receive"]
 tcp-align-empty-rx = ["socket-tcp"]
 tcp-gro-receive = ["tcp-scatter-receive", "proto-ipv4", "medium-ethernet", "alloc"]
