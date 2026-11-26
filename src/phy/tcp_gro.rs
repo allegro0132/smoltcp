@@ -1,6 +1,6 @@
 //! Checked, borrowed IPv4/TCP receive aggregation. This object changes storage
 //! representation only; Ethernet/IP address admission stays in the interface.
-use super::ChecksumCapabilities;
+use super::{ChecksumCapabilities, PacketMeta};
 use crate::wire::{IpAddress, Ipv4Packet, TcpControl, TcpPacket};
 
 pub use super::TCP_RX_MAX_FRAGMENTS as TCP_GRO_MAX_SEGMENTS;
@@ -14,7 +14,7 @@ pub const TCP_GRO_MAX_BYTES: usize = 32 * 1024;
 fn u16_at(b: &[u8], n: usize) -> u16 { u16::from_be_bytes([b[n], b[n + 1]]) }
 fn sequence(b: &[u8]) -> u32 { u32::from_be_bytes(b[38..42].try_into().unwrap()) }
 
-fn eligible(b: &[u8], caps: &ChecksumCapabilities) -> Option<(usize, usize)> {
+fn eligible(b: &[u8], caps: &ChecksumCapabilities, meta: PacketMeta) -> Option<(usize, usize)> {
     if b.len() < 54 || b[12..14] != [8, 0] || b[14] != 0x45
         || b[23] != 6 || b[15] & 3 != 0 || u16_at(b, 20) != 0x4000 {
         return None;
@@ -27,7 +27,7 @@ fn eligible(b: &[u8], caps: &ChecksumCapabilities) -> Option<(usize, usize)> {
     let ip = Ipv4Packet::new_checked(&b[14..end]).ok()?;
     let tcp = TcpPacket::new_checked(&b[TCP..end]).ok()?;
     if caps.ipv4.rx() && !ip.verify_checksum() { return None; }
-    if caps.tcp.rx() && !tcp.verify_checksum(&IpAddress::from(ip.src_addr()), &IpAddress::from(ip.dst_addr())) { return None; }
+    if caps.tcp.rx() && !meta.rx_tcp_checksum_verified && !tcp.verify_checksum(&IpAddress::from(ip.src_addr()), &IpAddress::from(ip.dst_addr())) { return None; }
     Some((header, end))
 }
 
@@ -88,6 +88,7 @@ pub enum TcpGroReject {
 pub struct TcpGroBuilder<'a> {
     group: TcpGro<'a>,
     caps: ChecksumCapabilities,
+    max_bytes: usize,
     mss: usize,
     next_sequence: u32,
     finished: bool,
@@ -95,24 +96,37 @@ pub struct TcpGroBuilder<'a> {
 
 impl<'a> TcpGroBuilder<'a> {
     pub fn new(first: &'a [u8], caps: &ChecksumCapabilities) -> Option<Self> {
-        let (header, end) = eligible(first, caps)?;
-        if end > TCP_GRO_MAX_BYTES { return None; }
+        Self::new_bounded(first, caps, PacketMeta::default(), TCP_GRO_MAX_BYTES)
+    }
+
+    /// Start a group using the receive token of this original frame. A NIC TCP
+    /// checksum completion applies only to this member, after the IPv4 guards.
+    /// The size limit includes the Ethernet header.
+    pub fn new_bounded(first: &'a [u8], caps: &ChecksumCapabilities, meta: PacketMeta, max_bytes: usize) -> Option<Self> {
+        let max_bytes = max_bytes.min(TCP_GRO_MAX_BYTES);
+        let (header, end) = eligible(first, caps, meta)?;
+        if end > max_bytes { return None; }
         let mss = end - header;
         let mut payloads = [&[][..]; TCP_GRO_MAX_SEGMENTS];
         payloads[0] = &first[header..end];
         Some(Self {
             group: TcpGro { first, payloads, count: 1, header, length: mss, flags: first[47],
                 verified_ipv4: caps.ipv4.rx(), verified_tcp: caps.tcp.rx() },
-            caps: caps.clone(), mss,
+            caps: caps.clone(), max_bytes, mss,
             next_sequence: sequence(first).wrapping_add(mss as u32),
             finished: first[47] & 8 != 0,
         })
     }
 
     pub fn push(&mut self, frame: &'a [u8]) -> Result<(), TcpGroReject> {
+        self.push_with_meta(frame, PacketMeta::default())
+    }
+
+    /// Append one frame with its own receive checksum status.
+    pub fn push_with_meta(&mut self, frame: &'a [u8], meta: PacketMeta) -> Result<(), TcpGroReject> {
         if self.finished { return Err(TcpGroReject::Finished); }
         if self.group.count == TCP_GRO_MAX_SEGMENTS { return Err(TcpGroReject::Capacity); }
-        let (header, end) = eligible(frame, &self.caps).ok_or(TcpGroReject::Ineligible)?;
+        let (header, end) = eligible(frame, &self.caps, meta).ok_or(TcpGroReject::Ineligible)?;
         let size = end - header;
         let first = self.group.first;
         if header != self.group.header || size > self.mss || sequence(frame) != self.next_sequence
@@ -122,7 +136,7 @@ impl<'a> TcpGroBuilder<'a> {
             return Err(TcpGroReject::Incompatible);
         }
         let length = self.group.length.checked_add(size).ok_or(TcpGroReject::Capacity)?;
-        if header + length > TCP_GRO_MAX_BYTES { return Err(TcpGroReject::Capacity); }
+        if header + length > self.max_bytes { return Err(TcpGroReject::Capacity); }
         // Commit only after every check: callers can retry a different frame
         // or finish the previously accepted prefix after any rejection.
         self.group.payloads[self.group.count] = &frame[header..end];

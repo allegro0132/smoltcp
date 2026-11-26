@@ -99,6 +99,29 @@ fn incremental_rejection_preserves_prefix_and_checksum_policy() {
 }
 
 #[test]
+fn nic_checksum_is_scoped_to_one_ipv4_tcp_member() {
+    let first = frame(-4, Some(99), TcpControl::None, b"abcd");
+    let mut second = frame(0, Some(99), TcpControl::None, b"efgh");
+    let mut last = frame(4, Some(99), TcpControl::Psh, b"ijkl");
+    let caps = ChecksumCapabilities::default();
+    let mut meta = crate::phy::PacketMeta::default();
+    meta.rx_tcp_checksum_verified = true;
+    // A descriptor may verify TCP even when its received checksum field is absent.
+    second[50..52].fill(0);
+    assert!(TcpGroBuilder::new_bounded(&first, &caps, meta, first.len() - 1).is_none());
+    let mut bounded = TcpGroBuilder::new_bounded(&first, &caps, meta, first.len() + 3).unwrap();
+    assert_eq!(bounded.push_with_meta(&second, meta), Err(TcpGroReject::Capacity));
+    let mut builder = TcpGroBuilder::new_bounded(&first, &caps, meta, 16384).unwrap();
+    assert_eq!(builder.push(&second), Err(TcpGroReject::Ineligible));
+    builder.push_with_meta(&second, meta).unwrap();
+    last[24] ^= 1; // IPv4 is still checked on a TCP-verified frame.
+    assert_eq!(builder.push_with_meta(&last, meta), Err(TcpGroReject::Ineligible));
+    let group = builder.finish().unwrap();
+    assert!(group.satisfies_checksum_policy(&caps));
+    assert_eq!(group.payloads(), &[&b"abcd"[..], &b"efgh"[..]]);
+}
+
+#[test]
 fn incremental_bounds_and_terminal_segments_preserve_accepted_data() {
     let caps = ChecksumCapabilities::default();
     let max = crate::phy::TCP_GRO_MAX_SEGMENTS;
